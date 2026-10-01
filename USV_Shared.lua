@@ -4144,8 +4144,22 @@ function USV.installMoveableHooks()
 		return false
 	end
 
-	-- No sprite-only override in new(): appearance sprites include vanilla fridges/lockers.
-	-- Real USV objects are handled in fromObject below, which checks the object itself.
+	-- ISMoveableCursor lists pickups via new(sprite) + isMoveable, so USV sprites must stay moveable here.
+	-- Only isMoveable is forced (appearance sprites include vanilla fridges/lockers); weight/tool
+	-- overrides live in fromObject, which checks the object. Vanilla moveability is kept so
+	-- canPickUpMoveableInternal can refuse non-USV objects that vanilla would not allow.
+	if type(ISMoveableSpriteProps.new) == "function" and not ISMoveableSpriteProps._USV_NewWrapped then
+		local prevNew = ISMoveableSpriteProps.new
+		ISMoveableSpriteProps.new = function(sprite)
+			local s = prevNew(sprite)
+			if s and s.spriteName and USV.resolveSpriteKind(s.spriteName) then
+				s._USV_vanillaMoveable = s.isMoveable and true or false
+				s.isMoveable = true
+			end
+			return s
+		end
+		ISMoveableSpriteProps._USV_NewWrapped = true
+	end
 
 	if type(ISMoveableSpriteProps.fromObject) == "function" and not ISMoveableSpriteProps._USV_FromObjectWrapped then
 		local prevFromObject = ISMoveableSpriteProps.fromObject
@@ -4237,6 +4251,10 @@ function USV.installMoveableHooks()
 				return allowed and true or false
 			end
 			return true
+		end
+		if self._USV_vanillaMoveable == false then
+			-- Vanilla object sharing a USV sprite: only moveable because of the new() override.
+			return false
 		end
 		return prev(self, _character, _square, _object, _isMulti)
 	end
