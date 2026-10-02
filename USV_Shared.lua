@@ -9,6 +9,11 @@ USV.FLAG = "USV_Unlimited"
 USV.AUTH_FLAG = "USV_Auth"
 USV.WEIGHTLESS_FLAG = "USV_Weightless"
 USV.CARRY_TOKEN = "USV_CarryToken"
+USV.CONTENTS_ID = "USV_ContentsId"
+USV.CONTENTS_FILE_PREFIX = "USV_" -- legacy short prefix
+USV.CONTENTS_FILE_PREFIX_LEGACY = "USV_Contents_" -- pre-fix27 files
+USV.CONTENTS_STORE_FILE = "USV_Store.json" -- single global store (all worlds in units[])
+USV.CONTENTS_STORE_VERSION = 4 -- global store; each unit carries its own world
 USV.OWNER_FLAG = "USV_OwnerId"
 USV.KIND_FLAG = "USV_Kind"
 USV.APPLIED_FLAG = "USV_Applied"
@@ -259,16 +264,14 @@ function USV.rebuildSpriteKindMap()
 			spriteToKind[spriteName] = kindId
 		end
 	end
+	-- Appearance-only sprites (vanilla fridge/locker tiles) must NOT map to USV kind identity.
 	for kindId, list in pairs(USV.APPEARANCES or {}) do
-		local def = USV.KINDS[kindId]
-		if def and type(list) == "table" then
+		if type(list) == "table" then
 			for i = 1, #list do
 				local app = list[i]
 				if app and app.faces then
 					for _, spriteName in pairs(app.faces) do
 						if type(spriteName) == "string" then
-							spriteToKind[spriteName] = kindId
-							def.sprites[spriteName] = true
 							appearanceBySprite[spriteName] = app.id
 						end
 					end
@@ -277,6 +280,12 @@ function USV.rebuildSpriteKindMap()
 		end
 	end
 end
+
+USV.CONTENTS_MAX_ITEMS = 10000 -- hard cap for snapshot packs (anti-abuse)
+USV.CONTENTS_MAX_STACK = 10000 -- max count on a single stacked descriptor row
+USV.BLIND_XFER_MAX_DIST = 12 -- tiles; BlindTransfer must be near the USV
+USV.CLIENT_CMD_RATE_WINDOW_MS = 1000
+USV.CLIENT_CMD_RATE_LIMIT = 80 -- commands per window per player (bulk transfer bursts)
 
 USV.rebuildSpriteKindMap()
 
@@ -293,6 +302,21 @@ function USV.getSandboxInt(key, fallback)
 	local root = SandboxVars and SandboxVars.UnlimitedStorageVault
 	if root and type(root[key]) == "number" then
 		return math.floor(root[key])
+	end
+	return fallback
+end
+
+function USV.getSandboxBool(key, fallback)
+	local root = SandboxVars and SandboxVars.UnlimitedStorageVault
+	if not root then
+		return fallback
+	end
+	local v = root[key]
+	if type(v) == "boolean" then
+		return v
+	end
+	if type(v) == "number" then
+		return v ~= 0
 	end
 	return fallback
 end
@@ -598,19 +622,6 @@ function USV.isAuthoritative()
 	return true -- singleplayer
 end
 
---- Server-only secret (never written to synced ModData).
-function USV.getServerSecret()
-	if not USV.isAuthoritative() then
-		return nil
-	end
-	if type(USV._serverSecret) == "string" and USV._serverSecret ~= "" then
-		return USV._serverSecret
-	end
-	local seed = tostring(os.time()) .. ":" .. tostring(ZombRand and ZombRand(1, 2000000000) or 42)
-	USV._serverSecret = "usv:" .. seed
-	return USV._serverSecret
-end
-
 --- Lua 5.1 / Kahlua compatible hash (no bitwise ~ which is Lua 5.3+ only).
 local function simpleHash(str)
 	local h = 2166136261
@@ -619,6 +630,44 @@ local function simpleHash(str)
 		h = (h * 16777619 + string.byte(str, i)) % 2147483647
 	end
 	return tostring(h)
+end
+
+--- Server-only secret (never written to synced ModData / never transmitted).
+--- Persisted in Lua/USV_ServerSecret.txt so auth tokens survive restarts.
+function USV.getServerSecret()
+	if not USV.isAuthoritative() then
+		return nil
+	end
+	if type(USV._serverSecret) == "string" and USV._serverSecret ~= "" then
+		return USV._serverSecret
+	end
+	local fileName = "USV_ServerSecret.txt"
+	local existing = nil
+	if getFileReader then
+		local ok, reader = pcall(getFileReader, fileName, false)
+		if ok and reader then
+			pcall(function()
+				existing = reader:readLine()
+				reader:close()
+			end)
+		end
+	end
+	if type(existing) == "string" and existing ~= "" and #existing >= 8 then
+		USV._serverSecret = existing
+		return USV._serverSecret
+	end
+	local seed = tostring(os.time()) .. ":" .. tostring(ZombRand and ZombRand(1, 2000000000) or 42)
+	USV._serverSecret = "usv:" .. simpleHash(seed) .. ":" .. tostring(os.time())
+	if getFileWriter then
+		local wok, writer = pcall(getFileWriter, fileName, true, false)
+		if wok and writer then
+			pcall(function()
+				writer:write(USV._serverSecret)
+				writer:close()
+			end)
+		end
+	end
+	return USV._serverSecret
 end
 
 function USV.makeAuthToken(obj, ownerId, kind, coords)
@@ -662,8 +711,7 @@ function USV.verifyAuthToken(obj)
 	return expected ~= nil and md[USV.AUTH_FLAG] == expected
 end
 
---- Soft legitimacy for capacity/UI: USV sprite + any prior USV signal.
---- (Strict ownerPlacement trust is only for ownership seal / anti-dupe, not capacity.)
+--- Soft legitimacy for capacity/UI: registered USV markers only (never sprite-only).
 function USV.objectNameLooksUSV(obj)
 	if not obj or not obj.getName then
 		return false
@@ -684,7 +732,7 @@ function USV.isUSVSpriteObject(obj)
 	return USV.resolveSpriteKind(USV.getSpriteNameFast(obj)) ~= nil
 end
 
---- Capacity / transfer bypass: correct sprite family (incl. tile-pack prefixes) + USV marker.
+--- Capacity / transfer bypass: USV ModData / registry only (vanilla tiles may share sprites).
 function USV.isLegitimateUSVObject(obj)
 	if not obj then
 		return false
@@ -692,24 +740,20 @@ function USV.isLegitimateUSVObject(obj)
 	if unlimitedParentRegistry[obj] then
 		return true
 	end
-	-- Name is enough to recover after sprite remaps / stripped flags.
-	if USV.objectNameLooksUSV(obj) then
-		return true
-	end
-	if not USV.isUSVSpriteObject(obj) then
-		return false
-	end
 	if USV.isFlaggedObject(obj) then
 		return true
 	end
-	local md = obj.getModData and obj:getModData() or nil
-	if md and (md[USV.KIND_FLAG] ~= nil or md[USV.OWNER_FLAG] ~= nil or md[USV.AUTH_FLAG] ~= nil) then
+	if USV.isTrustedUSVObject(obj) then
 		return true
 	end
 	if USV.isRegisteredPlacementObject(obj) then
 		return true
 	end
-	if USV.isTrustedUSVObject(obj) then
+	local md = obj.getModData and obj:getModData() or nil
+	if md and md[USV.KIND_FLAG] and (md[USV.OWNER_FLAG] or md[USV.AUTH_FLAG]) then
+		return true
+	end
+	if USV.objectNameLooksUSV(obj) and USV.isFlaggedObject(obj) then
 		return true
 	end
 	return false
@@ -984,6 +1028,14 @@ function USV.requiresSafehouseRules()
 		end
 	end
 	return false
+end
+
+--- Sandbox + MP: placement must be inside a safehouse the player belongs to.
+function USV.enforceSafehouseOnlyPlacement()
+	if not USV.getSandboxBool("SafehouseOnlyPlacement", true) then
+		return false
+	end
+	return USV.requiresSafehouseRules()
 end
 
 function USV.playerAllowedInSafehouse(sh, player, square)
@@ -1332,10 +1384,37 @@ function USV.countPlayerKind(kind, player, onlyLoaded)
 		end
 	end
 	local carried = carriedItems
-	if carriedSeals > carried then
+	-- Stale ownerPlacement.carried must not block a fresh build when inventory has no USV item.
+	if carriedItems > 0 and carriedSeals > carried then
 		carried = carriedSeals
 	end
 	return world + carried
+end
+
+function USV.pruneStaleCarriedSeals(kind, player)
+	if not USV.isAuthoritative() or not player or not USV.getKindDef(kind) then
+		return
+	end
+	if USV.countCarryingKind(kind, player) > 0 then
+		return
+	end
+	local ownerId = USV.getOwnerId(player)
+	local store = USV.getStore()
+	local list = ownerId and store and store.ownerPlacement and store.ownerPlacement[kind]
+		and store.ownerPlacement[kind][ownerId]
+	if not list then
+		return
+	end
+	local changed = false
+	for i = #list, 1, -1 do
+		if list[i] and list[i].carried then
+			table.remove(list, i)
+			changed = true
+		end
+	end
+	if changed then
+		USV.transmitStore()
+	end
 end
 
 --- True if this player still has a live world object or is carrying that kind.
@@ -1423,6 +1502,7 @@ function USV.canPlaceKind(kind, player, square, relocating)
 	if USV.isAuthoritative() then
 		USV.pruneStalePlacements(kind)
 		if not relocating then
+			USV.pruneStaleCarriedSeals(kind, player)
 			USV.reconcilePlayerKind(kind, player)
 		end
 	end
@@ -1433,18 +1513,16 @@ function USV.canPlaceKind(kind, player, square, relocating)
 		end
 	end
 	local sh = nil
-	if USV.requiresSafehouseRules() then
+	if USV.enforceSafehouseOnlyPlacement() and not relocating then
 		if not square or not player then
 			return false, "needSafehouse"
 		end
-		if not USV.playerAllowedInSafehouse(nil, player, square) then
+		sh = USV.getSafeHouseAt(square)
+		if not sh then
 			return false, "needSafehouse"
 		end
-		sh = USV.getSafeHouseAt(square)
-		if not sh and SafeHouse and SafeHouse.hasSafehouse then
-			pcall(function()
-				sh = SafeHouse.hasSafehouse(player)
-			end)
+		if not USV.playerAllowedInSafehouse(sh, player, square) then
+			return false, "needSafehouse"
 		end
 	elseif square then
 		sh = USV.getSafeHouseAt(square)
@@ -1584,15 +1662,18 @@ function USV.claim(kind, player, obj)
 	local sprite = USV.getSpriteNameFast(obj)
 	local spriteKind = USV.resolveSpriteKind(sprite)
 	if spriteKind ~= kind then
-		-- Allow kind mismatch only if sprite maps to this kind family
 		if not spriteKind then
-			USV.logError("claim rejected: invalid sprite " .. tostring(sprite))
-			return false
-		end
-		kind = spriteKind
-		def = USV.getKindDef(kind)
-		if not def then
-			return false
+			-- B42 entity builds may not expose tile sprites at OnCreate yet (see Invalid SpriteConfig).
+			if not USV.getKindDef(kind) then
+				USV.logError("claim rejected: invalid sprite " .. tostring(sprite))
+				return false
+			end
+		else
+			kind = spriteKind
+			def = USV.getKindDef(kind)
+			if not def then
+				return false
+			end
 		end
 	end
 	local store = USV.getStore()
@@ -1609,9 +1690,22 @@ function USV.claim(kind, player, obj)
 	if not md[USV.APPEARANCE_FLAG] then
 		md[USV.APPEARANCE_FLAG] = (USV.DEFAULT_APPEARANCE and USV.DEFAULT_APPEARANCE[kind]) or nil
 	end
+	if not md[USV.CONTENTS_ID] then
+		md[USV.CONTENTS_ID] = USV.newContentsId(id, kind, player)
+	end
 	if not USV.authorizeObject(obj, kind) then
 		USV.logError("claim: authorizeObject failed for " .. tostring(id))
 		return false
+	end
+	-- Never clobber an existing non-empty contents JSON (re-claim / scan must not wipe stash).
+	local existingSnap = USV.readContentsSnapshot(md[USV.CONTENTS_ID])
+	local existingCount = existingSnap and existingSnap.itemCount or 0
+	if existingCount <= 0 then
+		USV.writeContentsSnapshot(md[USV.CONTENTS_ID], {}, {
+			kind = kind,
+			ownerId = id,
+			ownerName = USV.resolveOwnerUserName(id, player),
+		})
 	end
 	USV.rememberUnlimitedParent(obj)
 	return true
@@ -1712,8 +1806,12 @@ function USV.getObjectKind(obj)
 	if md and md[USV.KIND_FLAG] and USV.KINDS[md[USV.KIND_FLAG]] then
 		return md[USV.KIND_FLAG]
 	end
-	-- Legacy vault objects (flagged but no kind)
+	-- Legacy flagged objects: prefer sprite kind (fridge tiles must not read as vault).
 	if md and md[USV.FLAG] == true then
+		local sk = USV.resolveSpriteKind(USV.getSpriteNameFast(obj))
+		if sk then
+			return sk
+		end
 		return "vault"
 	end
 	local sprite = USV.getSpriteNameFast(obj)
@@ -1794,7 +1892,11 @@ function USV.onWorldObjectRemoved(obj, reason)
 	if not USV.shouldReleaseOnRemove(obj) then
 		return
 	end
+	local contentsId = USV.getEntityContentsId(obj)
 	USV.clearAllContents(obj)
+	if contentsId then
+		USV.deleteContentsSnapshot(contentsId)
+	end
 	USV.releaseObject(obj)
 end
 
@@ -2051,6 +2153,1673 @@ function USV.findPackContainer(containers, pack)
 	return containers[1]
 end
 
+-- ---------------------------------------------------------------------------
+-- Contents JSON snapshot (carry / relocate durable backup)
+-- Files: Zomboid/Lua/USV_Store.json — one global store; units[] holds every vault/fridge (per-world via unit.world)
+-- JSON field `world` must match current save or restore is refused.
+-- Legacy unscoped USV_Contents_* / USV_<Name>_* are NOT used for restore (cross-world safety).
+-- ---------------------------------------------------------------------------
+
+local function usvJsonEscape(s)
+	s = tostring(s or "")
+	s = string.gsub(s, "\\", "\\\\")
+	s = string.gsub(s, '"', '\\"')
+	s = string.gsub(s, "\r", "\\r")
+	s = string.gsub(s, "\n", "\\n")
+	s = string.gsub(s, "\t", "\\t")
+	return s
+end
+
+function USV.jsonEncode(value)
+	local t = type(value)
+	if t == "nil" then
+		return "null"
+	elseif t == "boolean" then
+		return value and "true" or "false"
+	elseif t == "number" then
+		if value ~= value or value == math.huge or value == -math.huge then
+			return "null"
+		end
+		return tostring(value)
+	elseif t == "string" then
+		return '"' .. usvJsonEscape(value) .. '"'
+	elseif t ~= "table" then
+		return "null"
+	end
+	local isArray = true
+	local maxN = 0
+	for k, _ in pairs(value) do
+		if type(k) ~= "number" or k < 1 or math.floor(k) ~= k then
+			isArray = false
+			break
+		end
+		if k > maxN then
+			maxN = k
+		end
+	end
+	if isArray then
+		local parts = {}
+		for i = 1, maxN do
+			parts[#parts + 1] = USV.jsonEncode(value[i])
+		end
+		return "[" .. table.concat(parts, ",") .. "]"
+	end
+	local parts = {}
+	for k, v in pairs(value) do
+		if type(k) == "string" or type(k) == "number" then
+			parts[#parts + 1] = '"' .. usvJsonEscape(k) .. '":' .. USV.jsonEncode(v)
+		end
+	end
+	return "{" .. table.concat(parts, ",") .. "}"
+end
+
+function USV.jsonDecode(str)
+	if not str or str == "" then
+		return nil
+	end
+	local i = 1
+	local n = #str
+	local function peek()
+		return string.sub(str, i, i)
+	end
+	local function skipWs()
+		while i <= n do
+			local c = peek()
+			if c ~= " " and c ~= "\t" and c ~= "\r" and c ~= "\n" then
+				break
+			end
+			i = i + 1
+		end
+	end
+	local parseValue
+	local function parseString()
+		i = i + 1
+		local out = {}
+		while i <= n do
+			local c = peek()
+			if c == '"' then
+				i = i + 1
+				return table.concat(out)
+			elseif c == "\\" then
+				i = i + 1
+				local e = peek()
+				i = i + 1
+				if e == "n" then
+					out[#out + 1] = "\n"
+				elseif e == "r" then
+					out[#out + 1] = "\r"
+				elseif e == "t" then
+					out[#out + 1] = "\t"
+				else
+					out[#out + 1] = e
+				end
+			else
+				out[#out + 1] = c
+				i = i + 1
+			end
+		end
+		return table.concat(out)
+	end
+	local function parseNumber()
+		local start = i
+		if peek() == "-" then
+			i = i + 1
+		end
+		while i <= n and string.find(peek(), "%d") do
+			i = i + 1
+		end
+		if peek() == "." then
+			i = i + 1
+			while i <= n and string.find(peek(), "%d") do
+				i = i + 1
+			end
+		end
+		if peek() == "e" or peek() == "E" then
+			i = i + 1
+			if peek() == "+" or peek() == "-" then
+				i = i + 1
+			end
+			while i <= n and string.find(peek(), "%d") do
+				i = i + 1
+			end
+		end
+		return tonumber(string.sub(str, start, i - 1))
+	end
+	local function parseArray()
+		i = i + 1
+		local arr = {}
+		skipWs()
+		if peek() == "]" then
+			i = i + 1
+			return arr
+		end
+		while i <= n do
+			arr[#arr + 1] = parseValue()
+			skipWs()
+			local c = peek()
+			if c == "]" then
+				i = i + 1
+				break
+			elseif c == "," then
+				i = i + 1
+				skipWs()
+			else
+				break
+			end
+		end
+		return arr
+	end
+	local function parseObject()
+		i = i + 1
+		local obj = {}
+		skipWs()
+		if peek() == "}" then
+			i = i + 1
+			return obj
+		end
+		while i <= n do
+			skipWs()
+			if peek() ~= '"' then
+				break
+			end
+			local key = parseString()
+			skipWs()
+			if peek() == ":" then
+				i = i + 1
+			end
+			skipWs()
+			obj[key] = parseValue()
+			skipWs()
+			local c = peek()
+			if c == "}" then
+				i = i + 1
+				break
+			elseif c == "," then
+				i = i + 1
+			else
+				break
+			end
+		end
+		return obj
+	end
+	parseValue = function()
+		skipWs()
+		local c = peek()
+		if c == '"' then
+			return parseString()
+		elseif c == "{" then
+			return parseObject()
+		elseif c == "[" then
+			return parseArray()
+		elseif c == "t" and string.sub(str, i, i + 3) == "true" then
+			i = i + 4
+			return true
+		elseif c == "f" and string.sub(str, i, i + 4) == "false" then
+			i = i + 5
+			return false
+		elseif c == "n" and string.sub(str, i, i + 3) == "null" then
+			i = i + 4
+			return nil
+		else
+			return parseNumber()
+		end
+	end
+	local ok, result = pcall(parseValue)
+	if ok then
+		return result
+	end
+	return nil
+end
+
+function USV.sanitizeContentsId(id)
+	if not id then
+		return nil
+	end
+	local s = tostring(id)
+	-- Strip path / traversal characters first (Mac/Win/Linux).
+	s = string.gsub(s, "%.%.", "")
+	s = string.gsub(s, "[/\\]", "")
+	s = string.gsub(s, "[^%w%-%_]", "_")
+	s = string.gsub(s, "_+", "_")
+	s = string.gsub(s, "^_+", "")
+	s = string.gsub(s, "_+$", "")
+	if s == "" or #s > 96 then
+		return nil
+	end
+	return s
+end
+
+--- FullType must look like Module.ItemName (blocks path / script injection).
+function USV.isSafeItemFullType(ft)
+	if type(ft) ~= "string" or ft == "" or #ft > 128 then
+		return false
+	end
+	if string.find(ft, "%.%.", 1, true) or string.find(ft, "/", 1, true) or string.find(ft, "\\", 1, true) then
+		return false
+	end
+	return string.match(ft, "^[%w_]+%.[%w_]+$") ~= nil
+end
+
+function USV.itemScriptExists(ft)
+	if not USV.isSafeItemFullType(ft) then
+		return false
+	end
+	local ok = false
+	pcall(function()
+		if getScriptManager and getScriptManager().getItem then
+			ok = getScriptManager():getItem(ft) ~= nil
+		end
+	end)
+	return ok
+end
+
+--- Never persist raw steam IDs in Lua-folder JSON (shared-machine / backup privacy).
+function USV.ownerIdForDisk(ownerId)
+	if not ownerId or ownerId == "" then
+		return nil
+	end
+	local s = tostring(ownerId)
+	if string.match(s, "^steam:") then
+		local sum = 0
+		for i = 1, #s do
+			sum = (sum + string.byte(s, i) * i) % 100000000
+		end
+		return string.format("steam#%08d", sum)
+	end
+	return USV.sanitizeContentsId(s)
+end
+
+--- Validate / scrub client-supplied snapshot packs before writing on the server.
+--- Identical items are collapsed to one row with `count` (array length ≠ item quantity).
+function USV.descriptorStackKey(desc)
+	if type(desc) ~= "table" or not desc.ft then
+		return nil
+	end
+	local mdName = ""
+	if type(desc.md) == "table" and type(desc.md.customName) == "string" then
+		mdName = desc.md.customName
+	end
+	-- Round volatile floats so near-identical food stacks merge.
+	local function r4(n)
+		n = tonumber(n)
+		if not n then
+			return ""
+		end
+		return string.format("%.4f", n)
+	end
+	return table.concat({
+		tostring(desc.ft),
+		tostring(desc.condition or ""),
+		tostring(desc.conditionMax or ""),
+		desc.favorite and "1" or "0",
+		r4(desc.usedDelta),
+		desc.cooked and "1" or "0",
+		desc.burnt and "1" or "0",
+		desc.frozen and "1" or "0",
+		r4(desc.baseHunger),
+		r4(desc.hungChange),
+		tostring(desc.name or ""),
+		mdName,
+	}, "|")
+end
+
+function USV.collapseDescriptorItems(items)
+	if type(items) ~= "table" then
+		return {}
+	end
+	local maxStack = USV.CONTENTS_MAX_STACK or 10000
+	local map = {}
+	local order = {}
+	for _, desc in ipairs(items) do
+		if type(desc) == "table" and desc.ft then
+			local key = USV.descriptorStackKey(desc)
+			local add = tonumber(desc.count) or 1
+			if add < 1 then
+				add = 1
+			end
+			if add > maxStack then
+				add = maxStack
+			end
+			if key and map[key] then
+				local nextCount = (map[key].count or 1) + add
+				if nextCount > maxStack then
+					nextCount = maxStack
+				end
+				map[key].count = nextCount
+			elseif key then
+				local row = {}
+				for k, v in pairs(desc) do
+					if k ~= "count" then
+						row[k] = v
+					end
+				end
+				row.count = add
+				map[key] = row
+				order[#order + 1] = key
+			end
+		end
+	end
+	local out = {}
+	for _, key in ipairs(order) do
+		out[#out + 1] = map[key]
+	end
+	return out
+end
+
+function USV.descriptorItemsTotal(items)
+	if type(items) ~= "table" then
+		return 0
+	end
+	local n = 0
+	for _, desc in ipairs(items) do
+		if type(desc) == "table" then
+			local c = tonumber(desc.count) or 1
+			if c < 1 then
+				c = 1
+			end
+			n = n + c
+		end
+	end
+	return n
+end
+
+function USV.sanitizeSnapshotPacks(packs, kind)
+	if type(packs) ~= "table" then
+		return nil, "bad_packs"
+	end
+	local maxItems = USV.CONTENTS_MAX_ITEMS or 10000
+	local maxStack = USV.CONTENTS_MAX_STACK or 10000
+	local total = 0
+	local clean = {}
+	for _, pack in ipairs(packs) do
+		if type(pack) == "table" then
+			local p = {
+				index = tonumber(pack.index) or 0,
+				type = USV.sanitizeContentsId(tostring(pack.type or "")) or "",
+				items = {},
+			}
+			if type(pack.items) == "table" then
+				for _, desc in ipairs(pack.items) do
+					if type(desc) == "table" and USV.itemScriptExists(desc.ft) then
+						local ft = desc.ft
+						local deny = false
+						pcall(function()
+							if string.find(ft, "Moveable", 1, true) then
+								deny = true
+							end
+						end)
+						if not deny then
+							local stack = tonumber(desc.count) or 1
+							if stack < 1 then
+								stack = 1
+							end
+							if stack > maxStack then
+								stack = maxStack
+							end
+							local scrubbed = {
+								ft = ft,
+								count = stack,
+								name = type(desc.name) == "string" and string.sub(desc.name, 1, 128) or nil,
+								condition = tonumber(desc.condition),
+								conditionMax = tonumber(desc.conditionMax),
+								favorite = desc.favorite and true or nil,
+								usedDelta = tonumber(desc.usedDelta),
+								age = tonumber(desc.age),
+								cooked = desc.cooked and true or nil,
+								burnt = desc.burnt and true or nil,
+								frozen = desc.frozen and true or nil,
+								offAge = tonumber(desc.offAge),
+								offAgeMax = tonumber(desc.offAgeMax),
+								baseHunger = tonumber(desc.baseHunger),
+								hungChange = tonumber(desc.hungChange),
+								r = tonumber(desc.r),
+								g = tonumber(desc.g),
+								b = tonumber(desc.b),
+							}
+							if type(desc.md) == "table" and type(desc.md.customName) == "string" then
+								scrubbed.md = { customName = string.sub(desc.md.customName, 1, 128) }
+							end
+							p.items[#p.items + 1] = scrubbed
+							total = total + stack
+							if total > maxItems then
+								return nil, "too_many"
+							end
+						end
+					end
+				end
+			end
+			p.items = USV.collapseDescriptorItems(p.items)
+			clean[#clean + 1] = p
+		end
+	end
+	return clean, nil
+end
+
+function USV.getWorldSaveKey()
+	local world = ""
+	local mode = ""
+	local server = ""
+	pcall(function()
+		if getWorld and getWorld() and getWorld().getWorld then
+			world = tostring(getWorld():getWorld() or "")
+		end
+	end)
+	pcall(function()
+		if getCore and getCore() and getCore().getGameMode then
+			mode = tostring(getCore():getGameMode() or "")
+		end
+	end)
+	pcall(function()
+		if getServerName then
+			server = tostring(getServerName() or "")
+		end
+	end)
+	local raw = tostring(mode) .. "|" .. tostring(world) .. "|" .. tostring(server)
+	if raw == "||" or raw == "| |" or string.gsub(raw, "|", "") == "" then
+		raw = "default"
+	end
+	return raw
+end
+
+--- Short stable tag for filenames (keeps Mac paths short, avoids cross-world clashes).
+function USV.worldFileTag(worldKey)
+	worldKey = worldKey or USV.getWorldSaveKey()
+	local sum = 0
+	local s = tostring(worldKey)
+	for i = 1, #s do
+		sum = (sum + string.byte(s, i) * (i % 17 + 1)) % 1000000
+	end
+	local label = ""
+	pcall(function()
+		if getWorld and getWorld() and getWorld().getWorld then
+			label = tostring(getWorld():getWorld() or "")
+		end
+	end)
+	label = USV.sanitizeContentsId(label) or "w"
+	if #label > 6 then
+		label = string.sub(label, 1, 6)
+	end
+	return string.format("%s%04d", label, sum % 10000)
+end
+
+--- One global JSON store for all worlds: `USV_Store.json` with a units[] array.
+--- Each unit carries its own `world` / `worldTag` for isolation.
+function USV.contentsStoreFileName(_worldKey)
+	return USV.CONTENTS_STORE_FILE or "USV_Store.json"
+end
+
+--- Legacy per-world store name (fix36–37): `USV_<worldTag>.json`
+function USV.contentsWorldStoreFileName(worldKey)
+	local tag = USV.worldFileTag(worldKey)
+	return USV.CONTENTS_FILE_PREFIX .. tag .. ".json"
+end
+
+function USV.contentsFileName(id, legacy, worldScoped)
+	local safe = USV.sanitizeContentsId(id)
+	if not safe then
+		return nil
+	end
+	local prefix = legacy and USV.CONTENTS_FILE_PREFIX_LEGACY or USV.CONTENTS_FILE_PREFIX
+	if legacy or worldScoped == false then
+		-- Pre-world-scoped / explicit global name
+		return prefix .. safe .. ".json"
+	end
+	-- Legacy per-unit file (pre-unified store)
+	local tag = USV.worldFileTag()
+	return prefix .. tag .. "_" .. safe .. ".json"
+end
+
+--- Prefer in-game username so Lua folder files read as who owns the stash.
+function USV.findPlayerByOwnerId(ownerId)
+	if not ownerId then
+		return nil
+	end
+	local found = nil
+	if getOnlinePlayers then
+		pcall(function()
+			local list = getOnlinePlayers()
+			if list then
+				for i = 0, list:size() - 1 do
+					local p = list:get(i)
+					if p and USV.getOwnerId(p) == ownerId then
+						found = p
+						return
+					end
+				end
+			end
+		end)
+	end
+	if found then
+		return found
+	end
+	if getSpecificPlayer then
+		for i = 0, 3 do
+			local p = nil
+			pcall(function()
+				p = getSpecificPlayer(i)
+			end)
+			if p and USV.getOwnerId(p) == ownerId then
+				return p
+			end
+		end
+	end
+	return nil
+end
+
+function USV.resolveOwnerUserName(ownerId, player)
+	local name = nil
+	local p = player or USV.findPlayerByOwnerId(ownerId)
+	if p then
+		pcall(function()
+			if p.getUsername then
+				name = p:getUsername()
+			end
+		end)
+		if name and tostring(name) ~= "" then
+			return tostring(name)
+		end
+		pcall(function()
+			if p.getDisplayName then
+				name = p:getDisplayName()
+			end
+		end)
+		if name and tostring(name) ~= "" then
+			return tostring(name)
+		end
+	end
+	if type(ownerId) == "string" then
+		local user = string.match(ownerId, "^user:(.+)$")
+		if user and user ~= "" then
+			return user
+		end
+		local named = string.match(ownerId, "^name:(.+)$")
+		if named and named ~= "" then
+			return named
+		end
+		local steam = string.match(ownerId, "^steam:(.+)$")
+		if steam and steam ~= "" then
+			local digits = string.gsub(steam, "[^%d]", "")
+			if #digits > 4 then
+				digits = string.sub(digits, -4)
+			end
+			return "s" .. (digits ~= "" and digits or "0")
+		end
+	end
+	return "u"
+end
+
+local function usvKindFileTag(kind)
+	if kind == "fridge" then
+		return "f"
+	end
+	return "v"
+end
+
+--- Short readable unit id (stored inside the world JSON `units[]`, not as its own file).
+function USV.newContentsId(ownerId, kind, player)
+	local ownerName = USV.resolveOwnerUserName(ownerId, player)
+	local safeName = USV.sanitizeContentsId(ownerName) or "u"
+	if #safeName > 10 then
+		safeName = string.sub(safeName, 1, 10)
+	end
+	USV._contentsIdSeq = (USV._contentsIdSeq or 0) + 1
+	return string.format("%s_%s%d", safeName, usvKindFileTag(kind), USV._contentsIdSeq)
+end
+
+function USV.getEntityContentsId(entity)
+	if not entity or not entity.getModData then
+		return nil
+	end
+	local id = nil
+	pcall(function()
+		local md = entity:getModData()
+		id = md and md[USV.CONTENTS_ID] or nil
+	end)
+	return id
+end
+
+function USV.setEntityContentsId(entity, id)
+	if not entity or not entity.getModData or not id then
+		return
+	end
+	pcall(function()
+		local md = entity:getModData()
+		if md then
+			md[USV.CONTENTS_ID] = id
+		end
+	end)
+	if entity.transmitModData and USV.isAuthoritative and USV.isAuthoritative() then
+		pcall(function()
+			entity:transmitModData()
+		end)
+	end
+end
+
+function USV.copyModDataSafe(src)
+	local out = {}
+	if not src then
+		return out
+	end
+	pcall(function()
+		for k, v in pairs(src) do
+			local tk = type(k)
+			local tv = type(v)
+			if (tk == "string" or tk == "number") and (tv == "string" or tv == "number" or tv == "boolean") then
+				local ks = tostring(k)
+				if not string.find(ks, "USV_", 1, true) then
+					out[ks] = v
+				end
+			end
+		end
+	end)
+	return out
+end
+
+function USV.serializeInventoryItem(item)
+	if not item then
+		return nil
+	end
+	local desc = {
+		ft = USV.itemFullType(item),
+	}
+	if not desc.ft or desc.ft == "" then
+		return nil
+	end
+	pcall(function()
+		if item.getName then
+			desc.name = item:getName()
+		end
+		if item.getCondition then
+			desc.condition = item:getCondition()
+		end
+		if item.getConditionMax then
+			desc.conditionMax = item:getConditionMax()
+		end
+		if item.isFavorite and item:isFavorite() then
+			desc.favorite = true
+		end
+		if item.getUsedDelta then
+			desc.usedDelta = item:getUsedDelta()
+		end
+		if item.getAge then
+			desc.age = item:getAge()
+		end
+		if item.isCooked and item:isCooked() then
+			desc.cooked = true
+		end
+		if item.isBurnt and item:isBurnt() then
+			desc.burnt = true
+		end
+		if item.isFrozen and item:isFrozen() then
+			desc.frozen = true
+		end
+		if item.isPoisonous and item:isPoisonous() then
+			desc.poison = true
+		end
+		if item.getOffAge then
+			desc.offAge = item:getOffAge()
+		end
+		if item.getOffAgeMax then
+			desc.offAgeMax = item:getOffAgeMax()
+		end
+		if item.getBaseHunger then
+			desc.baseHunger = item:getBaseHunger()
+		end
+		if item.getHungChange then
+			desc.hungChange = item:getHungChange()
+		end
+		if item.getColorRed and item.getColorGreen and item.getColorBlue then
+			desc.r = item:getColorRed()
+			desc.g = item:getColorGreen()
+			desc.b = item:getColorBlue()
+		end
+		if item.getModData then
+			desc.md = USV.copyModDataSafe(item:getModData())
+		end
+	end)
+	return desc
+end
+
+function USV.createItemFromDescriptor(desc)
+	if not desc or not USV.isSafeItemFullType(desc.ft) or not USV.itemScriptExists(desc.ft) then
+		return nil
+	end
+	local item = nil
+	pcall(function()
+		if instanceItem then
+			item = instanceItem(desc.ft)
+		end
+	end)
+	if not item and InventoryItemFactory and InventoryItemFactory.CreateItem then
+		pcall(function()
+			item = InventoryItemFactory.CreateItem(desc.ft)
+		end)
+	end
+	if not item then
+		return nil
+	end
+	if USV.isUSVFurnitureItem(item) then
+		return nil
+	end
+	pcall(function()
+		if desc.name and item.setName then
+			item:setName(tostring(desc.name))
+		end
+		if desc.condition ~= nil and item.setCondition then
+			item:setCondition(tonumber(desc.condition) or 0)
+		end
+		if desc.favorite and item.setFavorite then
+			item:setFavorite(true)
+		end
+		if desc.usedDelta ~= nil and item.setUsedDelta then
+			item:setUsedDelta(tonumber(desc.usedDelta) or 0)
+		end
+		if desc.age ~= nil and item.setAge then
+			item:setAge(tonumber(desc.age) or 0)
+		end
+		if desc.cooked and item.setCooked then
+			item:setCooked(true)
+		end
+		if desc.burnt and item.setBurnt then
+			item:setBurnt(true)
+		end
+		if desc.frozen and item.setFrozen then
+			item:setFrozen(true)
+		end
+		-- Intentionally ignore desc.poison from JSON (cannot mark items poisonous via snapshot).
+		if desc.offAge ~= nil and item.setOffAge then
+			item:setOffAge(tonumber(desc.offAge) or 0)
+		end
+		if desc.offAgeMax ~= nil and item.setOffAgeMax then
+			item:setOffAgeMax(tonumber(desc.offAgeMax) or 0)
+		end
+		if desc.baseHunger ~= nil and item.setBaseHunger then
+			item:setBaseHunger(tonumber(desc.baseHunger) or 0)
+		end
+		if desc.hungChange ~= nil and item.setHungChange then
+			item:setHungChange(tonumber(desc.hungChange) or 0)
+		end
+		if desc.r ~= nil and item.setColorRed then
+			item:setColorRed(tonumber(desc.r) or 1)
+			item:setColorGreen(tonumber(desc.g) or 1)
+			item:setColorBlue(tonumber(desc.b) or 1)
+		end
+		if type(desc.md) == "table" and item.getModData then
+			local md = item:getModData()
+			if md and type(desc.md.customName) == "string" then
+				md.customName = string.sub(desc.md.customName, 1, 128)
+			end
+		end
+	end)
+	return item
+end
+
+function USV.packsToDescriptors(packs)
+	local out = {}
+	if not packs then
+		return out
+	end
+	for _, pack in ipairs(packs) do
+		local p = {
+			index = pack.index,
+			type = pack.type or "",
+			items = {},
+		}
+		if pack.items then
+			for _, invItem in ipairs(pack.items) do
+				local live = invItem
+				local desc = nil
+				if type(invItem) == "table" and invItem.ft then
+					desc = invItem
+				else
+					desc = USV.serializeInventoryItem(live)
+				end
+				if desc then
+					p.items[#p.items + 1] = desc
+				end
+			end
+		end
+		p.items = USV.collapseDescriptorItems(p.items)
+		out[#out + 1] = p
+	end
+	return out
+end
+
+function USV.descriptorsToPacks(data)
+	local packs = {}
+	if not data then
+		return packs
+	end
+	local list = data.packs or data
+	if type(list) ~= "table" then
+		return packs
+	end
+	local maxStack = USV.CONTENTS_MAX_STACK or 10000
+	local maxTotal = USV.CONTENTS_MAX_ITEMS or 10000
+	local spawned = 0
+	for _, pack in ipairs(list) do
+		local p = {
+			index = pack.index or 0,
+			type = pack.type or "",
+			items = {},
+		}
+		if pack.items then
+			for _, desc in ipairs(pack.items) do
+				local n = tonumber(desc.count) or 1
+				if n < 1 then
+					n = 1
+				end
+				if n > maxStack then
+					n = maxStack
+				end
+				for _ = 1, n do
+					if spawned >= maxTotal then
+						break
+					end
+					local item = USV.createItemFromDescriptor(desc)
+					if item then
+						p.items[#p.items + 1] = item
+						spawned = spawned + 1
+					end
+				end
+			end
+		end
+		packs[#packs + 1] = p
+	end
+	return packs
+end
+
+function USV.contentsUsesLegacyFile(id)
+	local safe = USV.sanitizeContentsId(id)
+	if not safe then
+		return false
+	end
+	-- New short ids: Name_v1 / Name_f2
+	if string.match(safe, "^[%w%-]+_[vf]%d+$") then
+		return false
+	end
+	return true
+end
+
+local function usvReadJsonFile(fileName)
+	if not fileName or not getFileReader then
+		return nil
+	end
+	local ok, reader = pcall(getFileReader, fileName, false)
+	if not ok or not reader then
+		return nil
+	end
+	local parts = {}
+	pcall(function()
+		local line = reader:readLine()
+		while line do
+			parts[#parts + 1] = line
+			line = reader:readLine()
+		end
+		reader:close()
+	end)
+	local text = table.concat(parts, "\n")
+	if not text or text == "" then
+		return nil
+	end
+	return text
+end
+
+local function usvWriteJsonFile(fileName, json)
+	if not fileName or not getFileWriter or not json then
+		return false
+	end
+	local ok = false
+	local wok, writer = pcall(getFileWriter, fileName, true, false)
+	if wok and writer then
+		pcall(function()
+			writer:write(json)
+			writer:close()
+			ok = true
+		end)
+	end
+	return ok
+end
+
+local function usvEmptyContentsStore()
+	return {
+		v = USV.CONTENTS_STORE_VERSION or 4,
+		units = {},
+	}
+end
+
+function USV.invalidateContentsStoreCache()
+	USV._contentsStoreCache = nil
+end
+
+local function usvFindStoreUnitIndex(store, id, worldKey)
+	if not store or type(store.units) ~= "table" or not id then
+		return nil
+	end
+	worldKey = worldKey or USV.getWorldSaveKey()
+	for i, unit in ipairs(store.units) do
+		if type(unit) == "table" and unit.id == id then
+			local uw = unit.world
+			if uw == nil or uw == worldKey then
+				return i
+			end
+		end
+	end
+	return nil
+end
+
+--- Import units from a legacy v3 per-world store file into the global store.
+local function usvImportWorldStoreFile(store, worldKey)
+	if type(store) ~= "table" or type(store.units) ~= "table" or not worldKey then
+		return 0
+	end
+	local oldName = USV.contentsWorldStoreFileName(worldKey)
+	local storeName = USV.contentsStoreFileName()
+	if not oldName or oldName == storeName then
+		return 0
+	end
+	local text = usvReadJsonFile(oldName)
+	if not text then
+		return 0
+	end
+	local old = USV.jsonDecode(text)
+	if type(old) ~= "table" or type(old.units) ~= "table" then
+		return 0
+	end
+	-- Only import if file world matches (or missing but tag matches current).
+	if type(old.world) == "string" and old.world ~= "" and old.world ~= worldKey then
+		return 0
+	end
+	local imported = 0
+	local tag = USV.worldFileTag(worldKey)
+	for _, unit in ipairs(old.units) do
+		if type(unit) == "table" and unit.id then
+			unit.world = worldKey
+			unit.worldTag = tag
+			local idx = usvFindStoreUnitIndex(store, unit.id, worldKey)
+			if idx then
+				store.units[idx] = unit
+			else
+				store.units[#store.units + 1] = unit
+			end
+			imported = imported + 1
+		end
+	end
+	if imported > 0 then
+		USV.deleteLuaFile(oldName)
+	end
+	return imported
+end
+
+function USV.loadContentsStore(worldKey)
+	worldKey = worldKey or USV.getWorldSaveKey()
+	local cache = USV._contentsStoreCache
+	if cache and cache.data and type(cache.data.units) == "table" then
+		-- Opportunistically import current world's legacy per-world file once per session.
+		if not cache.importedWorlds then
+			cache.importedWorlds = {}
+		end
+		if worldKey and not cache.importedWorlds[worldKey] then
+			cache.importedWorlds[worldKey] = true
+			if usvImportWorldStoreFile(cache.data, worldKey) > 0 then
+				USV.saveContentsStore(cache.data)
+			end
+		end
+		if worldKey then
+			if not USV._legacyPurgeDone then
+				USV._legacyPurgeDone = {}
+			end
+			if not USV._legacyPurgeDone[worldKey] then
+				USV._legacyPurgeDone[worldKey] = true
+				USV.purgeLegacyContentsFiles(worldKey)
+			end
+		end
+		return cache.data
+	end
+	local fileName = USV.contentsStoreFileName()
+	local text = usvReadJsonFile(fileName)
+	local store = nil
+	if text then
+		store = USV.jsonDecode(text)
+	end
+	if type(store) ~= "table" or type(store.units) ~= "table" then
+		store = usvEmptyContentsStore()
+	else
+		store.v = USV.CONTENTS_STORE_VERSION or 4
+		-- Strip obsolete top-level world binding from v3 files mistakenly named USV_Store.
+		store.world = nil
+		store.worldTag = nil
+	end
+	USV._contentsStoreCache = { data = store, importedWorlds = {} }
+	if worldKey then
+		USV._contentsStoreCache.importedWorlds[worldKey] = true
+		if usvImportWorldStoreFile(store, worldKey) > 0 then
+			USV.saveContentsStore(store)
+		end
+		-- One-shot per world: scrub leftover per-unit / per-world JSON stubs.
+		if not USV._legacyPurgeDone then
+			USV._legacyPurgeDone = {}
+		end
+		if not USV._legacyPurgeDone[worldKey] then
+			USV._legacyPurgeDone[worldKey] = true
+			USV.purgeLegacyContentsFiles(worldKey)
+		end
+	end
+	return store
+end
+
+function USV.saveContentsStore(store, _worldKey)
+	if type(store) ~= "table" then
+		return false
+	end
+	store.v = USV.CONTENTS_STORE_VERSION or 4
+	store.world = nil
+	store.worldTag = nil
+	if type(store.units) ~= "table" then
+		store.units = {}
+	end
+	local fileName = USV.contentsStoreFileName()
+	local json = USV.jsonEncode(store)
+	local ok = usvWriteJsonFile(fileName, json)
+	if ok then
+		local imported = USV._contentsStoreCache and USV._contentsStoreCache.importedWorlds or {}
+		USV._contentsStoreCache = { data = store, importedWorlds = imported }
+	end
+	return ok
+end
+
+local function usvUnitToSnapshot(unit, worldKey)
+	if type(unit) ~= "table" then
+		return nil
+	end
+	worldKey = worldKey or unit.world or USV.getWorldSaveKey()
+	return {
+		v = 2,
+		id = unit.id,
+		world = worldKey,
+		worldTag = unit.worldTag or USV.worldFileTag(worldKey),
+		kind = unit.kind,
+		ownerId = unit.ownerId,
+		ownerName = unit.ownerName,
+		updated = unit.updated,
+		itemCount = unit.itemCount or 0,
+		packs = unit.packs or {},
+	}
+end
+
+local function usvDeleteLegacyUnitFiles(safe, worldKey)
+	local tag = USV.worldFileTag(worldKey)
+	local storeName = USV.contentsStoreFileName()
+	local names = {
+		USV.CONTENTS_FILE_PREFIX .. tag .. "_" .. safe .. ".json",
+		USV.CONTENTS_FILE_PREFIX_LEGACY .. tag .. "_" .. safe .. ".json",
+		USV.CONTENTS_FILE_PREFIX .. safe .. ".json",
+		USV.CONTENTS_FILE_PREFIX_LEGACY .. safe .. ".json",
+		USV.contentsFileName(safe, false, false),
+		USV.contentsFileName(safe, true, false),
+		USV.contentsWorldStoreFileName(worldKey), -- old per-world store after unit migrated
+	}
+	local seen = {}
+	for _, fileName in ipairs(names) do
+		if fileName and not seen[fileName] and fileName ~= storeName then
+			seen[fileName] = true
+			USV.deleteLuaFile(fileName)
+		end
+	end
+end
+
+local function usvReadLegacyUnitSnapshot(safe, worldKey)
+	local tag = USV.worldFileTag(worldKey)
+	local candidates = {
+		USV.CONTENTS_FILE_PREFIX .. tag .. "_" .. safe .. ".json",
+		USV.CONTENTS_FILE_PREFIX_LEGACY .. tag .. "_" .. safe .. ".json",
+		USV.CONTENTS_FILE_PREFIX .. safe .. ".json",
+		USV.CONTENTS_FILE_PREFIX_LEGACY .. safe .. ".json",
+	}
+	for _, name in ipairs(candidates) do
+		local text = usvReadJsonFile(name)
+		if text then
+			local data = USV.jsonDecode(text)
+			if data then
+				-- Accept matching world, or legacy files with no world field.
+				if type(data.world) ~= "string" or data.world == "" or data.world == worldKey then
+					return data, name
+				end
+			end
+		end
+	end
+	return nil, nil
+end
+
+function USV.writeContentsSnapshot(id, packsOrData, meta)
+	local safe = USV.sanitizeContentsId(id)
+	if not safe then
+		return false
+	end
+	local packsDesc = nil
+	if type(packsOrData) == "table" and packsOrData.packs then
+		packsDesc = packsOrData.packs
+	else
+		packsDesc = USV.packsToDescriptors(packsOrData)
+	end
+	local cleaned = USV.sanitizeSnapshotPacks(packsDesc, meta and meta.kind)
+	if cleaned then
+		packsDesc = cleaned
+	end
+	local worldKey = USV.getWorldSaveKey()
+	local itemCount = 0
+	for _, pack in ipairs(packsDesc) do
+		itemCount = itemCount + USV.descriptorItemsTotal(pack.items)
+	end
+	local unit = {
+		id = safe,
+		world = worldKey,
+		worldTag = USV.worldFileTag(worldKey),
+		kind = meta and meta.kind or nil,
+		ownerId = USV.ownerIdForDisk(meta and meta.ownerId),
+		ownerName = (meta and meta.ownerName) or USV.resolveOwnerUserName(meta and meta.ownerId) or nil,
+		updated = (getTimestampMs and getTimestampMs()) or 0,
+		itemCount = itemCount,
+		packs = packsDesc,
+	}
+	local store = USV.loadContentsStore(worldKey)
+	local idx = usvFindStoreUnitIndex(store, safe, worldKey)
+	if idx then
+		store.units[idx] = unit
+	else
+		store.units[#store.units + 1] = unit
+	end
+	local fileName = USV.contentsStoreFileName()
+	local ok = USV.saveContentsStore(store)
+	if ok then
+		usvDeleteLegacyUnitFiles(safe, worldKey)
+	end
+	return ok
+end
+
+function USV.readContentsSnapshot(id)
+	local safe = USV.sanitizeContentsId(id)
+	if not safe then
+		return nil
+	end
+	local worldKey = USV.getWorldSaveKey()
+	local store = USV.loadContentsStore(worldKey)
+	local idx = usvFindStoreUnitIndex(store, safe, worldKey)
+	if idx then
+		local unit = store.units[idx]
+		-- Refuse cross-world unit if world is set and mismatched.
+		if type(unit.world) == "string" and unit.world ~= "" and unit.world ~= worldKey then
+			return nil
+		end
+		local data = usvUnitToSnapshot(unit, worldKey)
+		return data
+	end
+	-- Migrate legacy per-unit file into the unified store once.
+	local legacy, used = usvReadLegacyUnitSnapshot(safe, worldKey)
+	if not legacy then
+		return nil
+	end
+	local unit = {
+		id = safe,
+		world = worldKey,
+		worldTag = USV.worldFileTag(worldKey),
+		kind = legacy.kind,
+		ownerId = legacy.ownerId,
+		ownerName = legacy.ownerName,
+		updated = legacy.updated,
+		itemCount = legacy.itemCount or 0,
+		packs = legacy.packs or {},
+	}
+	store.units[#store.units + 1] = unit
+	USV.saveContentsStore(store)
+	usvDeleteLegacyUnitFiles(safe, worldKey)
+	return usvUnitToSnapshot(unit, worldKey)
+end
+
+function USV.deleteContentsSnapshot(id)
+	local safe = USV.sanitizeContentsId(id)
+	if not safe then
+		return false
+	end
+	local worldKey = USV.getWorldSaveKey()
+	local store = USV.loadContentsStore(worldKey)
+	local idx = usvFindStoreUnitIndex(store, safe, worldKey)
+	local removed = false
+	if idx then
+		table.remove(store.units, idx)
+		removed = USV.saveContentsStore(store)
+	end
+	usvDeleteLegacyUnitFiles(safe, worldKey)
+	return true
+end
+
+--- Resolve absolute path under Zomboid/Lua/ for getFileWriter-relative names.
+function USV.luaFolderAbsolutePath(relName)
+	if not relName or relName == "" then
+		return nil
+	end
+	local sep = "/"
+	pcall(function()
+		if getFileSeparator then
+			sep = getFileSeparator()
+		end
+	end)
+	local bases = {}
+	local function addBase(b)
+		if type(b) == "string" and b ~= "" then
+			bases[#bases + 1] = b
+		end
+	end
+	pcall(function()
+		if getCore and getCore() and getCore().getMyDocumentFolder then
+			addBase(getCore():getMyDocumentFolder())
+		end
+	end)
+	pcall(function()
+		if ZomboidFileSystem and ZomboidFileSystem.instance and ZomboidFileSystem.instance.getMyDocumentFolder then
+			addBase(ZomboidFileSystem.instance:getMyDocumentFolder())
+		end
+	end)
+	pcall(function()
+		if ZomboidFileSystem and ZomboidFileSystem.instance and ZomboidFileSystem.instance.getCacheDir then
+			addBase(ZomboidFileSystem.instance:getCacheDir())
+		end
+	end)
+	local seen = {}
+	local out = {}
+	for _, base in ipairs(bases) do
+		local normalized = tostring(base)
+		-- Avoid .../Lua/Lua when the API already points at Lua/.
+		local withLua = normalized
+		if not string.find(string.lower(normalized), "[/\\]lua[/\\]?$") then
+			withLua = normalized .. sep .. "Lua"
+		end
+		local abs = withLua .. sep .. tostring(relName)
+		if not seen[abs] then
+			seen[abs] = true
+			out[#out + 1] = abs
+		end
+	end
+	return out[1], out
+end
+
+local function usvFileStillReadable(relName)
+	local text = usvReadJsonFile(relName)
+	return text ~= nil and text ~= ""
+end
+
+--- Truly delete a Lua-folder file (not just empty-overwrite).
+function USV.deleteLuaFile(relName)
+	if not relName or relName == "" then
+		return false
+	end
+	if relName == (USV.CONTENTS_STORE_FILE or "USV_Store.json") then
+		return false
+	end
+	local primary, allAbs = USV.luaFolderAbsolutePath(relName)
+	allAbs = allAbs or (primary and { primary } or {})
+	local deleted = false
+	local function tryAbs(abs)
+		if not abs or deleted then
+			return
+		end
+		pcall(function()
+			if ZomboidFileSystem and ZomboidFileSystem.instance then
+				local fs = ZomboidFileSystem.instance
+				if fs.tryDeleteFile then
+					fs:tryDeleteFile(abs)
+				end
+				if fs.deleteFile then
+					fs:deleteFile(abs)
+				end
+			end
+		end)
+		pcall(function()
+			local f = nil
+			if luajava and luajava.newInstance then
+				f = luajava.newInstance("java.io.File", abs)
+			end
+			if f and f.exists and f:exists() and f.delete then
+				if f:delete() then
+					deleted = true
+				end
+			end
+		end)
+		if not deleted and os and os.remove then
+			local ok = pcall(os.remove, abs)
+			if ok then
+				deleted = true
+			end
+		end
+	end
+	-- Relative name (some FS helpers expect Lua/-relative paths).
+	pcall(function()
+		if ZomboidFileSystem and ZomboidFileSystem.instance and ZomboidFileSystem.instance.tryDeleteFile then
+			ZomboidFileSystem.instance:tryDeleteFile(relName)
+		end
+	end)
+	for _, abs in ipairs(allAbs) do
+		tryAbs(abs)
+	end
+	-- Authority: if getFileReader can no longer open it, treat as deleted.
+	if not usvFileStillReadable(relName) then
+		deleted = true
+	end
+	-- Do NOT write tombstone stubs — that recreates files the user sees as "not consolidated".
+	return deleted
+end
+
+--- After unified store is authoritative: remove leftover USV_*.json / USV_Contents_*.json stubs.
+function USV.purgeLegacyContentsFiles(worldKey)
+	worldKey = worldKey or USV.getWorldSaveKey()
+	local storeName = USV.CONTENTS_STORE_FILE or "USV_Store.json"
+	local removed = 0
+	local failed = 0
+	local store = USV._contentsStoreCache and USV._contentsStoreCache.data or nil
+	if type(store) == "table" and type(store.units) == "table" then
+		for _, unit in ipairs(store.units) do
+			if type(unit) == "table" and unit.id then
+				local safe = USV.sanitizeContentsId(unit.id)
+				local wk = unit.world or worldKey
+				if safe then
+					usvDeleteLegacyUnitFiles(safe, wk)
+				end
+			end
+		end
+	end
+	-- Always try current-world legacy names + common stub patterns.
+	local tag = USV.worldFileTag(worldKey)
+	local extras = {
+		USV.contentsWorldStoreFileName(worldKey),
+		USV.CONTENTS_FILE_PREFIX .. tag .. ".json",
+		USV.CONTENTS_FILE_PREFIX_LEGACY .. tag .. ".json",
+	}
+	if type(store) == "table" and type(store.units) == "table" then
+		for _, unit in ipairs(store.units) do
+			if type(unit) == "table" and unit.id then
+				local safe = USV.sanitizeContentsId(unit.id)
+				if safe then
+					extras[#extras + 1] = USV.CONTENTS_FILE_PREFIX .. safe .. ".json"
+					extras[#extras + 1] = USV.CONTENTS_FILE_PREFIX_LEGACY .. safe .. ".json"
+					extras[#extras + 1] = USV.CONTENTS_FILE_PREFIX .. tag .. "_" .. safe .. ".json"
+					extras[#extras + 1] = USV.CONTENTS_FILE_PREFIX_LEGACY .. tag .. "_" .. safe .. ".json"
+				end
+			end
+		end
+	end
+	-- Directory sweep: any USV_*.json except the unified store.
+	pcall(function()
+		local _, absList = USV.luaFolderAbsolutePath(".")
+		local luaDirs = {}
+		if absList then
+			for _, absDot in ipairs(absList) do
+				local dir = string.gsub(absDot, "[/\\]%.$", "")
+				luaDirs[#luaDirs + 1] = dir
+			end
+		end
+		for _, dir in ipairs(luaDirs) do
+			local list = nil
+			if luajava and luajava.newInstance then
+				local f = luajava.newInstance("java.io.File", dir)
+				if f and f.list then
+					list = f:list()
+				end
+			end
+			if list then
+				local n = list.length or (list.length == nil and #list) or 0
+				-- Java String[] may expose :length or be iterable via size-like APIs.
+				local count = 0
+				pcall(function()
+					count = list.length
+				end)
+				if not count or count == 0 then
+					pcall(function()
+						count = #list
+					end)
+				end
+				for i = 0, (count or 0) - 1 do
+					local name = nil
+					pcall(function()
+						name = list[i] or list:get(i)
+					end)
+					if type(name) == "string" then
+						local lower = string.lower(name)
+						if lower ~= string.lower(storeName)
+							and string.match(lower, "^usv_.*%.json$")
+							and not string.match(lower, "^usv_serversecret")
+						then
+							extras[#extras + 1] = name
+						end
+					end
+				end
+			end
+		end
+	end)
+	local seen = {}
+	for _, fileName in ipairs(extras) do
+		if fileName and not seen[fileName] and fileName ~= storeName then
+			seen[fileName] = true
+			if usvFileStillReadable(fileName) then
+				if USV.deleteLuaFile(fileName) then
+					removed = removed + 1
+				else
+					failed = failed + 1
+				end
+			end
+		end
+	end
+	return removed, failed
+end
+
+function USV.snapshotPacksFromEntity(entity)
+	local packs = {}
+	local containers = USV.collectContainers(entity)
+	for index, cont in ipairs(containers) do
+		if cont and not USV.containerIsCharacterInventory(cont) then
+			local pack = { index = index - 1, type = "", items = {} }
+			pcall(function()
+				pack.type = cont.getType and tostring(cont:getType() or "") or ""
+			end)
+			pcall(function()
+				local items = cont.getItems and cont:getItems() or nil
+				if items then
+					for j = 0, items:size() - 1 do
+						local invItem = items:get(j)
+						if invItem and invItem ~= entity and not USV.isUSVFurnitureItem(invItem) then
+							local desc = USV.serializeInventoryItem(invItem)
+							if desc then
+								pack.items[#pack.items + 1] = desc
+							end
+						end
+					end
+				end
+			end)
+			packs[#packs + 1] = pack
+		end
+	end
+	return packs
+end
+
+function USV.getContainerWorldObject(container)
+	if not container then
+		return nil
+	end
+	local parent = nil
+	pcall(function()
+		parent = container.getParent and container:getParent() or nil
+	end)
+	if parent and USV.isLegitimateUSVObject(parent) then
+		return parent
+	end
+	parent = USV.resolveContainerParent(container)
+	if parent and USV.isLegitimateUSVObject(parent) then
+		return parent
+	end
+	return nil
+end
+
+function USV.ensureContentsIdForEntity(entity, ownerId, kind)
+	local id = USV.getEntityContentsId(entity)
+	if id and id ~= "" then
+		return id
+	end
+	id = USV.newContentsId(ownerId, kind)
+	USV.setEntityContentsId(entity, id)
+	return id
+end
+
+function USV.syncEntityContentsSnapshot(entity)
+	if not entity then
+		return false
+	end
+	local md = nil
+	pcall(function()
+		md = entity.getModData and entity:getModData() or nil
+	end)
+	local kind = (md and md[USV.KIND_FLAG]) or USV.getObjectKind(entity) or "vault"
+	local ownerId = md and md[USV.OWNER_FLAG] or nil
+	local id = USV.ensureContentsIdForEntity(entity, ownerId, kind)
+	local packs = USV.snapshotPacksFromEntity(entity)
+	return USV.writeContentsSnapshot(id, packs, {
+		kind = kind,
+		ownerId = ownerId,
+		ownerName = USV.resolveOwnerUserName(ownerId),
+	})
+end
+
+function USV.saveCarryContentsSnapshot(carryItem, packs, kind, ownerId, existingId)
+	if not carryItem then
+		return nil
+	end
+	local id = existingId or USV.getEntityContentsId(carryItem) or USV.newContentsId(ownerId, kind)
+	USV.setEntityContentsId(carryItem, id)
+	local ownerName = USV.resolveOwnerUserName(ownerId)
+	USV.writeContentsSnapshot(id, packs, { kind = kind, ownerId = ownerId, ownerName = ownerName })
+	if isClient and isClient() and not (isServer and isServer()) and sendClientCommand then
+		local args = {
+			id = id,
+			kind = kind,
+			ownerId = ownerId,
+			ownerName = ownerName,
+			packs = USV.packsToDescriptors(packs),
+		}
+		pcall(function()
+			local player = nil
+			if getSpecificPlayer then
+				player = getSpecificPlayer(0)
+			end
+			if player then
+				sendClientCommand(player, "USV", "SaveContents", args)
+			end
+		end)
+	end
+	return id
+end
+
+function USV.restoreContentsFromSnapshot(entity, contentsId)
+	if not entity or not contentsId then
+		return 0
+	end
+	local data = USV.readContentsSnapshot(contentsId)
+	if not data or not data.packs then
+		return 0
+	end
+	-- Extra guard: never restore another world's stash even if file was copied.
+	local worldKey = USV.getWorldSaveKey()
+	if data.world and data.world ~= worldKey then
+		return 0
+	end
+	local packs = USV.descriptorsToPacks(data)
+	local n = USV.depositContainerItems(entity, packs)
+	return n
+end
+
+--- Add one item to a container (DoAddItemBlind for USV unlimited containers).
+function USV.addItemToContainerSafe(cont, invItem)
+	if not cont or not invItem then
+		return false
+	end
+	if USV.isUnlimitedContainer(cont) then
+		USV.ensureContainerCapacity(cont)
+		if cont.isItemAllowed then
+			local okA, allow = pcall(function()
+				return cont:isItemAllowed(invItem)
+			end)
+			if okA and not allow then
+				return false
+			end
+		end
+		if type(USV._rawDoAddItemBlind) == "function" then
+			local ok, res = pcall(USV._rawDoAddItemBlind, cont, invItem)
+			if ok and res ~= nil then
+				if isServer and isServer() and sendAddItemToContainer then
+					pcall(function()
+						sendAddItemToContainer(cont, invItem)
+					end)
+				end
+				return true
+			end
+		end
+		local okB, resB = pcall(function()
+			return cont:DoAddItemBlind(invItem)
+		end)
+		if okB and resB ~= nil then
+			if isServer and isServer() and sendAddItemToContainer then
+				pcall(function()
+					sendAddItemToContainer(cont, invItem)
+				end)
+			end
+			return true
+		end
+		return false
+	end
+	local added = false
+	pcall(function()
+		if cont.DoAddItem then
+			local r = cont:DoAddItem(invItem)
+			added = r ~= nil
+		elseif cont.AddItem then
+			local r = cont:AddItem(invItem)
+			added = r ~= nil
+		end
+		if added and isServer and isServer() and sendAddItemToContainer then
+			sendAddItemToContainer(cont, invItem)
+		end
+	end)
+	return added
+end
+
+function USV.packsItemCount(packs)
+	local n = 0
+	if not packs then
+		return 0
+	end
+	for _, pack in ipairs(packs) do
+		if pack.items then
+			for _, it in ipairs(pack.items) do
+				if type(it) == "table" and it.ft then
+					local c = tonumber(it.count) or 1
+					if c < 1 then
+						c = 1
+					end
+					n = n + c
+				else
+					n = n + 1 -- live InventoryItem refs
+				end
+			end
+		end
+	end
+	return n
+end
+
+function USV.restoreCarryPacksToItem(item, packs)
+	if not item or not packs or USV.packsItemCount(packs) <= 0 then
+		return false
+	end
+	USV.storeCarryPacks(item, packs)
+	return true
+end
+
 function USV.depositContainerItems(entity, packs)
 	if not entity or not packs then
 		return 0
@@ -2066,17 +3835,7 @@ function USV.depositContainerItems(entity, packs)
 			local remain = {}
 			for _, invItem in ipairs(pack.items) do
 				if invItem and (not USV.isUSVFurnitureItem(invItem)) then
-					local added = false
-					pcall(function()
-						if cont.AddItem then
-							cont:AddItem(invItem)
-							added = true
-						end
-						if added and sendAddItemToContainer then
-							sendAddItemToContainer(cont, invItem)
-						end
-					end)
-					if added then
+					if USV.addItemToContainerSafe(cont, invItem) then
 						deposited = deposited + 1
 					else
 						remain[#remain + 1] = invItem
@@ -2251,34 +4010,176 @@ function USV.isUSVCarryItem(item)
 	if not item then
 		return false
 	end
+	if USV.isAuthorizedCarryItem(item) then
+		return true
+	end
 	if item.getModData then
 		local ok, md = pcall(function()
 			return item:getModData()
 		end)
-		if ok and md then
-			if md[USV.FLAG] == true or md[USV.WEIGHTLESS_FLAG] == true or md[USV.CARRY_TOKEN] ~= nil or md[USV.KIND_FLAG] ~= nil then
-				return true
-			end
+		if ok and md and md[USV.FLAG] == true and (md[USV.OWNER_FLAG] or md[USV.KIND_FLAG]) then
+			return true
 		end
 	end
-	if USV.isAuthorizedCarryItem(item) then
-		return true
-	end
-	-- No world-sprite fallback: vanilla fridge/locker items share USV appearance sprites.
 	return false
 end
 
---- True if an in-world object or sprite is a USV furniture item (eligible for empty-bypass pickup).
-function USV.isUSVMoveableObject(obj, spriteName)
-	-- Sprite alone is not enough: appearance sprites include vanilla fridges/lockers.
-	if obj then
-		return USV.isLegitimateUSVObject(obj) or USV.isFlaggedObject(obj)
+--- Picked-up vault/fridge: inventory burden should be MOVEABLE_CARRY_WEIGHT (contents ignored).
+function USV.useFixedCarryWeight(item)
+	if not item then
+		return false
+	end
+	if USV.isUSVCarryItem(item) or USV.isUSVMoveableItem(item) or USV.isUSVFurnitureItem(item) then
+		return true
+	end
+	if item.getModData then
+		local ok, md = pcall(function()
+			return item:getModData()
+		end)
+		if ok and md and md[USV.WEIGHTLESS_FLAG] == true then
+			return true
+		end
 	end
 	return false
+end
+
+function USV.getContainerParentItem(container)
+	if not container or not container.getContainingItem then
+		return nil
+	end
+	local parentItem = nil
+	pcall(function()
+		parentItem = container:getContainingItem()
+	end)
+	return parentItem
+end
+
+--- ItemContainer that belongs to a wearable or world-placed bag (not player main inventory).
+function USV.containerIsBagInventory(container)
+	if not container then
+		return false
+	end
+	local parentItem = USV.getContainerParentItem(container)
+	if not parentItem then
+		return false
+	end
+	if instanceof then
+		local ok, isBag = pcall(function()
+			if instanceof(parentItem, "InventoryContainer") then
+				return true
+			end
+			if parentItem.IsInventoryContainer and parentItem:IsInventoryContainer() then
+				return true
+			end
+			return false
+		end)
+		if ok and isBag then
+			return true
+		end
+	end
+	return false
+end
+
+--- USV vault/fridge must not nest inside bags; may use other containers (e.g. vehicle).
+function USV.usvFurnitureBlockedInContainer(item, destContainer)
+	if not item or not destContainer then
+		return false, nil
+	end
+	if not USV.isUSVFurnitureItem(item) and not USV.useFixedCarryWeight(item) then
+		return false, nil
+	end
+	if USV.containerIsBagInventory(destContainer) then
+		return true, "bag"
+	end
+	return false, nil
+end
+
+--- True if an in-world object is a registered USV furniture item (not vanilla lookalike tiles).
+function USV.isUSVMoveableObject(obj, _spriteName)
+	if not obj then
+		return false
+	end
+	return USV.isLegitimateUSVObject(obj)
 end
 
 function USV.parentLooksLikeUSV(parent)
 	return USV.isLegitimateUSVObject(parent)
+end
+
+--- Authoritative capacity: FLAG / custom-name alone is not enough (anti forge).
+function USV.isCapacityTrustedParent(obj)
+	if not obj then
+		return false
+	end
+	if unlimitedParentRegistry[obj] then
+		return true
+	end
+	if USV.isTrustedUSVObject(obj) then
+		return true
+	end
+	if USV.isAuthoritative() and USV.verifyAuthToken(obj) then
+		return true
+	end
+	if USV.isRegisteredPlacementObject(obj) and USV.isFlaggedObject(obj) then
+		return true
+	end
+	return false
+end
+
+function USV.playerNearObjectOrSquare(player, obj, sq, maxDist)
+	if not player then
+		return false
+	end
+	maxDist = maxDist or USV.BLIND_XFER_MAX_DIST or 12
+	local ps = nil
+	pcall(function()
+		ps = player.getSquare and player:getSquare() or nil
+	end)
+	if not ps then
+		return false
+	end
+	local tx, ty, tz = nil, nil, 0
+	if obj and obj.getSquare then
+		pcall(function()
+			local osq = obj:getSquare()
+			if osq then
+				tx, ty, tz = osq:getX(), osq:getY(), osq:getZ() or 0
+			end
+		end)
+	end
+	if (tx == nil) and sq then
+		pcall(function()
+			tx, ty, tz = sq:getX(), sq:getY(), sq:getZ() or 0
+		end)
+	end
+	if tx == nil then
+		return false
+	end
+	local dx = math.abs((ps:getX() or 0) - tx)
+	local dy = math.abs((ps:getY() or 0) - ty)
+	local dz = math.abs((ps:getZ() or 0) - (tz or 0))
+	return dx <= maxDist and dy <= maxDist and dz <= 1
+end
+
+function USV.allowClientCommand(player, command)
+	if not player then
+		return false
+	end
+	local id = USV.getOwnerId(player) or tostring(player)
+	USV._cmdRate = USV._cmdRate or {}
+	local now = (getTimestampMs and getTimestampMs()) or (os.time() * 1000)
+	local window = USV.CLIENT_CMD_RATE_WINDOW_MS or 1000
+	local limit = USV.CLIENT_CMD_RATE_LIMIT or 80
+	local bucket = USV._cmdRate[id]
+	if not bucket or (now - (bucket.t or 0)) > window then
+		USV._cmdRate[id] = { t = now, n = 1, cmd = command }
+		return true
+	end
+	bucket.n = (bucket.n or 0) + 1
+	if bucket.n > limit then
+		return false
+	end
+	return true
 end
 
 function USV.isUnlimitedContainer(container)
@@ -2306,7 +4207,18 @@ function USV.isUnlimitedContainer(container)
 		parent = USV.resolveContainerParent(container)
 	end
 
-	-- Container custom name (∞ / Unlimited / 無限) — works even when parent sprite is remapped.
+	-- Server / SP: never grant unlimited from forged FLAG or renamed customName alone.
+	if USV.isAuthoritative() then
+		if parent and USV.isCapacityTrustedParent(parent) then
+			USV.rememberUnlimitedParent(parent)
+			USV.rememberUnlimitedContainer(container, true)
+			USV.ensureContainerCapacity(container)
+			return true
+		end
+		return false
+	end
+
+	-- Client soft path (UI / prediction only — server rejects forged BlindTransfer).
 	if nativeParent then
 		local okN, cname = pcall(function()
 			return container.getCustomName and container:getCustomName() or nil
@@ -2339,7 +4251,6 @@ function USV.isUnlimitedContainer(container)
 		return false
 	end
 
-	-- Capacity bypass: USV sprite family + any legitimacy signal (not sealed-owner only).
 	if USV.isLegitimateUSVObject(parent) then
 		USV.rememberUnlimitedParent(parent)
 		USV.rememberUnlimitedContainer(container, true)
@@ -2347,6 +4258,582 @@ function USV.isUnlimitedContainer(container)
 		return true
 	end
 
+	return false
+end
+
+function USV.getUSVKindForContainer(container)
+	if not container then
+		return nil
+	end
+	local parent = nil
+	pcall(function()
+		parent = container.getParent and container:getParent() or nil
+	end)
+	if not parent then
+		parent = USV.resolveContainerParent(container)
+	end
+	if not parent then
+		return nil
+	end
+	return USV.getObjectKind(parent)
+end
+
+function USV.containerCustomNameLooksLikeFridge(container)
+	if not container or not container.getCustomName then
+		return false
+	end
+	local ok, cname = pcall(function()
+		return container:getCustomName()
+	end)
+	if not ok or not cname or cname == "" then
+		return false
+	end
+	local s = tostring(cname)
+	local def = USV.KINDS.fridge
+	if def then
+		local keyName = getText and getText(def.containerNameKey) or nil
+		if keyName and keyName ~= "" and s == keyName then
+			return true
+		end
+		if def.containerNameFallback and s == def.containerNameFallback then
+			return true
+		end
+	end
+	if string.find(s, "Fridge", 1, true) or string.find(s, "冷蔵", 1, true) then
+		return true
+	end
+	return false
+end
+
+--- True when this unlimited container belongs to a USV commercial fridge (not vault).
+function USV.containerIsUSVFridge(container)
+	if not container then
+		return false
+	end
+	local kind = USV.getUSVKindForContainer(container)
+	if kind == "fridge" then
+		return true
+	end
+	if kind == "vault" then
+		local parent = nil
+		pcall(function()
+			parent = container.getParent and container:getParent() or nil
+		end)
+		if not parent then
+			parent = USV.resolveContainerParent(container)
+		end
+		if parent and USV.resolveSpriteKind(USV.getSpriteNameFast(parent)) == "fridge" then
+			return true
+		end
+		return false
+	end
+	if not USV.isUnlimitedContainer(container) then
+		return false
+	end
+	local ctype = ""
+	pcall(function()
+		ctype = container.getType and tostring(container:getType() or "") or ""
+	end)
+	if ctype == "fridge" or ctype == "freezer" then
+		return true
+	end
+	return USV.containerCustomNameLooksLikeFridge(container)
+end
+
+function USV.containerFridgeCompartmentType(container)
+	local ctype = ""
+	pcall(function()
+		ctype = container.getType and tostring(container:getType() or "") or ""
+	end)
+	return ctype
+end
+
+function USV.instanceofAny(item, ...)
+	if not item or not instanceof then
+		return false
+	end
+	local n = select("#", ...)
+	for i = 1, n do
+		local cls = select(i, ...)
+		local ok, yes = pcall(function()
+			return instanceof(item, cls)
+		end)
+		if ok and yes then
+			return true
+		end
+	end
+	return false
+end
+
+--- Non-food classes/categories that must never enter USV fridges (ammo, ID, tools, etc.).
+function USV.itemFridgeHardDeny(item)
+	if not item then
+		return true
+	end
+	if USV.instanceofAny(
+		item,
+		"HandWeapon",
+		"Clothing",
+		"InventoryContainer",
+		"Literature",
+		"MapItem",
+		"AlarmClock",
+		"Radio"
+	) then
+		return true
+	end
+	local dc = USV.itemScriptDisplayCategory(item)
+	if dc then
+		local denyCat = {
+			Ammo = true,
+			Weapon = true,
+			WeaponPart = true,
+			Literature = true,
+			Tool = true,
+			Electronics = true,
+			Communications = true,
+			Cartography = true,
+			Container = true,
+			Camping = true,
+			Fishing = true,
+			Trapping = true,
+			Gardening = true,
+			Household = true,
+			Material = true,
+			Mechanics = true,
+			Media = true,
+			Clothing = true,
+			Accessory = true,
+			Appearance = true,
+			Animal = true,
+			SkillBook = true,
+		}
+		if denyCat[dc] then
+			return true
+		end
+	end
+	local uiCat = nil
+	pcall(function()
+		if item.getDisplayCategory then
+			uiCat = item:getDisplayCategory()
+		end
+	end)
+	if uiCat and uiCat ~= "" then
+		local denyUi = {
+			Ammo = true,
+			Weapon = true,
+			Literature = true,
+			Tool = true,
+			Electronics = true,
+			Cartography = true,
+		}
+		if denyUi[uiCat] then
+			return true
+		end
+		if getText then
+			local ammoLbl = getText("IGUI_ItemCategory_Ammo")
+			if ammoLbl and ammoLbl ~= "" and ammoLbl ~= "IGUI_ItemCategory_Ammo" and uiCat == ammoLbl then
+				return true
+			end
+			local weapLbl = getText("IGUI_ItemCategory_Weapon")
+			if weapLbl and weapLbl ~= "" and weapLbl ~= "IGUI_ItemCategory_Weapon" and uiCat == weapLbl then
+				return true
+			end
+		end
+	end
+	local ft = string.lower(USV.itemFullType(item))
+	local denyFt = {
+		"bullet",
+		"bullets",
+		"ammo",
+		"shell",
+		"shotgun",
+		"cartridge",
+		"idcard",
+		"id_card",
+		"identification",
+		"magazine",
+		"9mm",
+		"45auto",
+		"223",
+		"308",
+		"556",
+		"762",
+	}
+	for i = 1, #denyFt do
+		if string.find(ft, denyFt[i], 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+--- Food/drink rules for USV fridge compartments (no script-nutrition heuristic).
+function USV.isFridgeFoodItemStrict(item)
+	if not item or USV.isUSVFurnitureItem(item) or USV.isTobaccoItem(item) then
+		return false
+	end
+	if USV.itemFridgeHardDeny(item) then
+		return false
+	end
+	if instanceof then
+		local okW, isWeapon = pcall(function()
+			return instanceof(item, "HandWeapon")
+		end)
+		if okW and isWeapon then
+			return false
+		end
+		local okC, isCloth = pcall(function()
+			return instanceof(item, "Clothing")
+		end)
+		if okC and isCloth then
+			return false
+		end
+		local ok, isFoodClass = pcall(function()
+			return instanceof(item, "Food")
+		end)
+		if ok and isFoodClass then
+			return true
+		end
+	end
+	local isFoodFlag = false
+	pcall(function()
+		if type(item.IsFood) == "function" then
+			isFoodFlag = item:IsFood() and true or false
+		elseif type(item.isFood) == "function" then
+			isFoodFlag = item:isFood() and true or false
+		end
+	end)
+	if isFoodFlag then
+		return true
+	end
+	if USV.itemScriptCategoryFoodOrDrink(item) or USV.itemUiCategoryIsFoodOrDrink(item) then
+		return true
+	end
+	if USV.isConsumableDrainable(item) then
+		return true
+	end
+	return false
+end
+
+function USV.itemAllowedInUSVFridge(container, item, oldIsItemAllowed, ...)
+	if not item or not container or type(oldIsItemAllowed) ~= "function" then
+		return false
+	end
+	if not USV.isInventoryItemArg(item) then
+		return false
+	end
+	if USV.isTobaccoItem(item) then
+		return false
+	end
+	if USV.itemFridgeHardDeny(item) or not USV.isFridgeFoodItemStrict(item) then
+		return false
+	end
+	local ok, allow = pcall(oldIsItemAllowed, container, item, ...)
+	local allowed = ok and allow == true
+	if allowed then
+	end
+	return allowed
+end
+
+function USV.itemScriptDisplayCategory(item)
+	if not item then
+		return nil
+	end
+	local dc = nil
+	pcall(function()
+		local script = item.getScript and item:getScript() or nil
+		if script and script.getDisplayCategory then
+			dc = script:getDisplayCategory()
+		end
+	end)
+	return dc
+end
+
+function USV.itemFullType(item)
+	if not item then
+		return ""
+	end
+	local ft = ""
+	pcall(function()
+		if item.getFullType then
+			ft = tostring(item:getFullType() or "")
+		elseif item.getType and item.getModule then
+			ft = tostring(item:getModule()) .. "." .. tostring(item:getType())
+		end
+	end)
+	return ft
+end
+
+function USV.isInventoryItemArg(obj)
+	if not obj then
+		return false
+	end
+	if instanceof then
+		local okSkip, skip = pcall(function()
+			return instanceof(obj, "IsoGameCharacter")
+				or instanceof(obj, "IsoPlayer")
+				or instanceof(obj, "IsoZombie")
+		end)
+		if okSkip and skip then
+			return false
+		end
+		local ok, yes = pcall(function()
+			return instanceof(obj, "InventoryItem")
+		end)
+		if ok then
+			return yes == true
+		end
+	end
+	if type(obj.getFullType) == "function" then
+		local ft = ""
+		pcall(function()
+			ft = tostring(obj:getFullType() or "")
+		end)
+		return ft ~= "" and string.find(ft, "%.") ~= nil
+	end
+	return false
+end
+
+--- First InventoryItem argument in hasRoomFor(...); B42 may pass (player, item) or (item).
+function USV.pickInventoryItemArg(...)
+	local n = select("#", ...)
+	local fallback = nil
+	for i = 1, n do
+		local a = select(i, ...)
+		if not a then
+			-- skip
+		elseif instanceof then
+			local okItem, isItem = pcall(function()
+				return instanceof(a, "InventoryItem")
+			end)
+			if okItem and isItem then
+				return a
+			end
+		elseif type(a.getFullType) == "function" then
+			fallback = fallback or a
+		end
+	end
+	if fallback and USV.isInventoryItemArg(fallback) then
+		return fallback
+	end
+	return nil
+end
+
+function USV.itemScriptHasTag(item, tagName)
+	if not item or not tagName or tagName == "" then
+		return false
+	end
+	local function tagMatches(t)
+		return t ~= nil and tostring(t) == tagName
+	end
+	local function scanTagList(tags)
+		if not tags or type(tags.size) ~= "function" then
+			return false
+		end
+		local n = 0
+		local okN, count = pcall(function()
+			return tags:size()
+		end)
+		if not okN or not count then
+			return false
+		end
+		n = count
+		for i = 0, n - 1 do
+			local okT, t = pcall(function()
+				if type(tags.get) == "function" then
+					return tags:get(i)
+				end
+				return nil
+			end)
+			if okT and tagMatches(t) then
+				return true
+			end
+		end
+		return false
+	end
+	local ok, found = pcall(function()
+		if type(item.getTags) == "function" then
+			local okTags, tags = pcall(function()
+				return item:getTags()
+			end)
+			if okTags and scanTagList(tags) then
+				return true
+			end
+		end
+		local script = nil
+		if type(item.getScriptItem) == "function" then
+			local okS, s = pcall(function()
+				return item:getScriptItem()
+			end)
+			if okS then
+				script = s
+			end
+		end
+		if not script and type(item.getScript) == "function" then
+			local okS, s = pcall(function()
+				return item:getScript()
+			end)
+			if okS then
+				script = s
+			end
+		end
+		if script and type(script.getTags) == "function" then
+			local okTags, tags = pcall(function()
+				return script:getTags()
+			end)
+			if okTags and scanTagList(tags) then
+				return true
+			end
+		end
+		return false
+	end)
+	return ok and found == true
+end
+
+--- Cigarettes / cigars / tobacco mods — never treat as fridge food.
+function USV.isTobaccoItem(item)
+	if not item or not USV.isInventoryItemArg(item) then
+		return false
+	end
+	local ft = USV.itemFullType(item)
+	if ft ~= "" then
+		if string.find(ft, "KnoxCountySmokes", 1, true) then
+			return true
+		end
+		local lower = string.lower(ft)
+		for _, token in ipairs({ "cigarette", "cigarettes", "tobacco", "cigar", "cigars", "smoking", "smokes." }) do
+			if string.find(lower, token, 1, true) then
+				return true
+			end
+		end
+	end
+	local dc = USV.itemScriptDisplayCategory(item)
+	if dc == "Smokes" or dc == "Tobacco" then
+		return true
+	end
+	for _, tag in ipairs({ "Smokes", "Tobacco", "Cigarette", "Cigar" }) do
+		if USV.itemScriptHasTag(item, tag) then
+			return true
+		end
+	end
+	return false
+end
+
+function USV.itemUiCategoryIsFoodOrDrink(item)
+	if not item then
+		return false
+	end
+	local cat = nil
+	pcall(function()
+		if item.getDisplayCategory then
+			cat = item:getDisplayCategory()
+		end
+	end)
+	if not cat or cat == "" then
+		return false
+	end
+	local labels = { "Food", "Drink", "Water" }
+	if getText then
+		labels[#labels + 1] = getText("IGUI_ItemCategory_Food")
+		local drink = getText("IGUI_ItemCategory_Drink")
+		if drink and drink ~= "" and drink ~= "IGUI_ItemCategory_Drink" then
+			labels[#labels + 1] = drink
+		end
+	end
+	for i = 1, #labels do
+		if labels[i] and cat == labels[i] then
+			return true
+		end
+	end
+	return false
+end
+
+function USV.itemScriptCategoryFoodOrDrink(item)
+	local dc = USV.itemScriptDisplayCategory(item)
+	return dc == "Food" or dc == "Drink" or dc == "Water"
+end
+
+function USV.itemScriptHasNutrition(item)
+	local ok = false
+	pcall(function()
+		local script = item.getScript and item:getScript() or nil
+		if not script then
+			return
+		end
+		if script.getCalories and (script:getCalories() or 0) > 0 then
+			ok = true
+		end
+		if script.getHungerChange and (script:getHungerChange() or 0) ~= 0 then
+			ok = true
+		end
+		if script.getThirstChange and (script:getThirstChange() or 0) ~= 0 then
+			ok = true
+		end
+	end)
+	return ok
+end
+
+function USV.isConsumableDrainable(item)
+	if not item then
+		return false
+	end
+	local isDrain = false
+	pcall(function()
+		isDrain = item.IsDrainable and item:IsDrainable() and true or false
+	end)
+	if not isDrain then
+		return false
+	end
+	local ft = string.lower(USV.itemFullType(item))
+	if string.find(ft, "gasoline", 1, true) or string.find(ft, "petrol", 1, true) then
+		return false
+	end
+	if USV.itemScriptCategoryFoodOrDrink(item) or USV.itemUiCategoryIsFoodOrDrink(item) then
+		return true
+	end
+	local hasEffect = false
+	pcall(function()
+		if item.getHungChange and (item:getHungChange() or 0) ~= 0 then
+			hasEffect = true
+		end
+		if item.getThirstChange and (item:getThirstChange() or 0) ~= 0 then
+			hasEffect = true
+		end
+	end)
+	return hasEffect
+end
+
+--- Fridge contents: food/drink (incl. juice, alcohol, mod food). Tobacco excluded.
+function USV.isFridgeFoodItem(item)
+	if not item or USV.isUSVFurnitureItem(item) or USV.isTobaccoItem(item) then
+		return false
+	end
+	if instanceof then
+		local ok, isFoodClass = pcall(function()
+			return instanceof(item, "Food")
+		end)
+		if ok and isFoodClass then
+			return true
+		end
+	end
+	local isFoodFlag = false
+	pcall(function()
+		if type(item.IsFood) == "function" then
+			isFoodFlag = item:IsFood() and true or false
+		elseif type(item.isFood) == "function" then
+			isFoodFlag = item:isFood() and true or false
+		end
+	end)
+	if isFoodFlag then
+		return true
+	end
+	if USV.itemScriptCategoryFoodOrDrink(item) or USV.itemUiCategoryIsFoodOrDrink(item) then
+		return true
+	end
+	if USV.isConsumableDrainable(item) then
+		return true
+	end
 	return false
 end
 
@@ -2378,7 +4865,10 @@ function USV.resolveContainerParent(container)
 		end
 		for i = 0, objects:size() - 1 do
 			local obj = objects:get(i)
-			if obj and USV.isVaultSprite(USV.getSpriteNameFast(obj)) then
+			local spr = USV.getSpriteNameFast(obj)
+			local isOwner = obj
+				and (USV.isLegitimateUSVObject(obj) or USV.isFlaggedObject(obj) or USV.resolveSpriteKind(spr) ~= nil)
+			if isOwner then
 				local count = obj.getContainerCount and obj:getContainerCount() or 0
 				for ci = 0, count - 1 do
 					if obj:getContainerByIndex(ci) == container then
@@ -2387,10 +4877,6 @@ function USV.resolveContainerParent(container)
 					end
 				end
 				if obj.getItemContainer and obj:getItemContainer() == container then
-					parent = obj
-					return
-				end
-				if USV.isFlaggedObject(obj) then
 					parent = obj
 					return
 				end
@@ -2657,6 +5143,10 @@ function USV.scanSquare(square)
 		end
 		if kind and USV.isLegitimateUSVObject(obj) then
 			USV.applyObject(obj, true, kind)
+		elseif USV.isAuthoritative() and USV.isFlaggedObject(obj) and not USV.isTrustedUSVObject(obj)
+			and not USV.isRegisteredPlacementObject(obj) then
+			-- Forged FLAG / KIND without seal or registry — strip so capacity bypass cannot stick.
+			USV.stripUntrustedFlags(obj)
 		end
 	end
 end
@@ -2941,8 +5431,52 @@ function USV.installCapacityHooks()
 	end
 	if type(oldHasRoomFor) == "function" then
 		index.hasRoomFor = function(self, ...)
+			local transferItem = USV.pickInventoryItemArg(...)
+			if transferItem and USV.useFixedCarryWeight(transferItem) then
+				if USV.containerIsBagInventory(self) then
+					return false
+				end
+				if not isUnlimitedSafe(self) then
+					local carryW = USV.MOVEABLE_CARRY_WEIGHT or 1
+					local maxW = 0
+					pcall(function()
+						maxW = self:getMaxWeight()
+					end)
+					local used = 0
+					pcall(function()
+						used = self:getCapacityWeight()
+					end)
+					if maxW > 0 and used + carryW > maxW + 0.001 then
+						return false
+					end
+					if self.isItemAllowed then
+						local okAllow, allowed = pcall(function()
+							return self:isItemAllowed(transferItem)
+						end)
+						if okAllow and not allowed then
+							return false
+						end
+					end
+					return true
+				end
+			end
 			if isUnlimitedSafe(self) then
 				USV.ensureContainerCapacity(self)
+				local fridge = USV.containerIsUSVFridge(self)
+				if transferItem and self.isItemAllowed then
+					local okAllow, allowed = pcall(function()
+						return self:isItemAllowed(transferItem)
+					end)
+					if not okAllow then
+						if fridge then
+							return false
+						end
+					elseif not allowed then
+						return false
+					end
+				elseif fridge then
+					return oldHasRoomFor(self, ...)
+				end
 				return true
 			end
 			return oldHasRoomFor(self, ...)
@@ -2993,15 +5527,33 @@ function USV.installCapacityHooks()
 
 	-- Java AddItem checks Capacity (hard-capped at 100) vs real weight; USV often already exceeds 100.
 	-- Always route InventoryItem adds through DoAddItemBlind for USV.
+	local function usvRejectItemAdd(container, item)
+		if not item or not container or not container.isItemAllowed then
+			return false
+		end
+		local ok, allowed = pcall(function()
+			return container:isItemAllowed(item)
+		end)
+		if USV.containerIsUSVFridge(container) then
+			return (not ok) or (not allowed)
+		end
+		return ok and not allowed
+	end
+
 	if type(oldAddItem) == "function" then
 		index.AddItem = function(self, first, ...)
 			if isUnlimitedSafe(self) then
 				USV.ensureContainerCapacity(self)
 				local argc = select("#", ...)
-				if first ~= nil and type(first) ~= "string" and argc == 0 and type(oldDoAddItemBlind) == "function" then
-					local ok, result = pcall(oldDoAddItemBlind, self, first)
-					if ok then
-						return result
+				if first ~= nil and type(first) ~= "string" and argc == 0 then
+					if usvRejectItemAdd(self, first) then
+						return nil
+					end
+					if type(oldDoAddItemBlind) == "function" then
+						local ok, result = pcall(oldDoAddItemBlind, self, first)
+						if ok then
+							return result
+						end
 					end
 				end
 			end
@@ -3010,11 +5562,16 @@ function USV.installCapacityHooks()
 	end
 	if type(oldDoAddItem) == "function" then
 		index.DoAddItem = function(self, first, ...)
-			if isUnlimitedSafe(self) and first ~= nil and type(oldDoAddItemBlind) == "function" then
+			if isUnlimitedSafe(self) and first ~= nil then
 				USV.ensureContainerCapacity(self)
-				local ok, result = pcall(oldDoAddItemBlind, self, first)
-				if ok then
-					return result
+				if type(first) ~= "string" and usvRejectItemAdd(self, first) then
+					return nil
+				end
+				if type(oldDoAddItemBlind) == "function" then
+					local ok, result = pcall(oldDoAddItemBlind, self, first)
+					if ok then
+						return result
+					end
 				end
 			end
 			return oldDoAddItem(self, first, ...)
@@ -3024,16 +5581,41 @@ function USV.installCapacityHooks()
 		index.DoAddItemBlind = function(self, first, ...)
 			if isUnlimitedSafe(self) then
 				USV.ensureContainerCapacity(self)
+				if first ~= nil and type(first) ~= "string" and usvRejectItemAdd(self, first) then
+					return nil
+				end
 			end
 			return oldDoAddItemBlind(self, first, ...)
 		end
 	end
 	if type(oldIsItemAllowed) == "function" then
 		index.isItemAllowed = function(self, item, ...)
+			if item and not USV.isInventoryItemArg(item) then
+				if isUnlimitedSafe(self) and USV.containerIsUSVFridge(self) then
+					return false
+				end
+				return oldIsItemAllowed(self, item, ...)
+			end
+			local blocked, why = USV.usvFurnitureBlockedInContainer(item, self)
+			if blocked then
+				local destType = ""
+				pcall(function()
+					destType = self.getType and tostring(self:getType() or "") or ""
+				end)
+				return false
+			end
 			if isUnlimitedSafe(self) then
 				USV.ensureContainerCapacity(self)
 				if USV.isUSVFurnitureItem(item) then
 					return false
+				end
+				if USV.containerIsUSVFridge(self) then
+					local allow = USV.itemAllowedInUSVFridge(self, item, oldIsItemAllowed, ...)
+					local ctype = USV.containerFridgeCompartmentType(self)
+					if not allow then
+					elseif not USV.isFridgeFoodItemStrict(item) and ctype ~= "fridge" and ctype ~= "freezer" then
+					end
+					return allow
 				end
 			end
 			return oldIsItemAllowed(self, item, ...)
@@ -3043,60 +5625,56 @@ function USV.installCapacityHooks()
 	UnlimitedStorageVault_CapacityHooksInstalled = true
 end
 
---- Pack a container reference for MP BlindTransfer (Java ItemTransaction rejects over-cap containers).
-function USV.packContainerRef(container, character)
+--- Parent object + square for MP container refs (avoid falling back to player tile).
+function USV.getWorldContainerPackContext(container, character)
 	if not container then
-		return nil
-	end
-	if character and character.getInventory and container == character:getInventory() then
-		return { kind = "player" }
-	end
-	local containing = nil
-	pcall(function()
-		containing = container.getContainingItem and container:getContainingItem() or nil
-	end)
-	if containing and containing.getID then
-		return { kind = "bag", itemID = containing:getID() }
+		return nil, nil, nil, nil, nil, 0
 	end
 	local parent = nil
 	pcall(function()
 		parent = container.getParent and container:getParent() or nil
 	end)
+	if not parent then
+		parent = USV.resolveContainerParent(container)
+	end
+	local coords = parent and (USV.getLiveCoords(parent) or USV.getObjectCoords(parent)) or nil
 	local sq = nil
-	pcall(function()
-		sq = container.getSourceGrid and container:getSourceGrid() or nil
-	end)
-	if not sq and parent and parent.getSquare then
+	if parent and parent.getSquare then
 		pcall(function()
 			sq = parent:getSquare()
 		end)
 	end
-	if not sq and parent and instanceof and instanceof(parent, "IsoGridSquare") then
-		sq = parent
+	if not sq and coords and getCell then
+		pcall(function()
+			sq = getCell():getGridSquare(coords.x, coords.y, coords.z or 0)
+		end)
+	end
+	if not sq then
+		pcall(function()
+			if container.getSourceGrid then
+				sq = container:getSourceGrid()
+			end
+		end)
 	end
 	if not sq and container.getSquare then
 		pcall(function()
 			sq = container:getSquare()
 		end)
 	end
-	if not sq and character and character.getSquare then
+	if not sq and not parent and character and character.getSquare then
 		pcall(function()
 			sq = character:getSquare()
 		end)
 	end
-	if not sq then
-		return nil
-	end
-	local ctype = container.getType and container:getType() or ""
-	if ctype == "floor" or (parent == nil and sq) then
-		return {
-			kind = "floor",
-			x = sq:getX(),
-			y = sq:getY(),
-			z = sq:getZ(),
-			type = "floor",
-			index = 0,
-		}
+	local ownerId, kind = nil, nil
+	if parent and parent.getModData then
+		pcall(function()
+			local md = parent:getModData()
+			if md then
+				ownerId = md[USV.OWNER_FLAG]
+				kind = md[USV.KIND_FLAG]
+			end
+		end)
 	end
 	local index = 0
 	if parent and parent.getContainerCount then
@@ -3107,6 +5685,138 @@ function USV.packContainerRef(container, character)
 				break
 			end
 		end
+	elseif parent and parent.getItemContainer and parent:getItemContainer() == container then
+		index = 0
+	end
+	return parent, sq, coords, ownerId, kind, index
+end
+
+function USV.worldObjectMatchesContainerRef(obj, ref)
+	if not obj or not ref then
+		return false
+	end
+	if ref.usvOwner or ref.usvKind or ref.usvX ~= nil then
+		if not (USV.isLegitimateUSVObject(obj) or USV.isFlaggedObject(obj)) then
+			return false
+		end
+		local md = obj.getModData and obj:getModData() or nil
+		if ref.usvOwner and (not md or md[USV.OWNER_FLAG] ~= ref.usvOwner) then
+			return false
+		end
+		if ref.usvKind and md and md[USV.KIND_FLAG] and md[USV.KIND_FLAG] ~= ref.usvKind then
+			return false
+		end
+		if ref.usvX ~= nil and ref.usvY ~= nil then
+			local c = USV.getLiveCoords(obj) or USV.getObjectCoords(obj)
+			if not c or c.x ~= ref.usvX or c.y ~= ref.usvY or (c.z or 0) ~= (ref.usvZ or 0) then
+				return false
+			end
+		end
+		return true
+	end
+	return true
+end
+
+function USV.containerFromWorldObject(obj, ref)
+	if not obj then
+		return nil
+	end
+	local idx = ref.index or 0
+	if obj.getContainerCount then
+		local count = obj:getContainerCount() or 0
+		if count > 0 then
+			local c = obj:getContainerByIndex(idx)
+			if c then
+				local ctype = c.getType and c:getType() or ""
+				if not ref.type or ref.type == "" or ctype == ref.type then
+					return c
+				end
+			end
+			for ci = 0, count - 1 do
+				local c2 = obj:getContainerByIndex(ci)
+				if c2 and c2.getType and c2:getType() == ref.type then
+					return c2
+				end
+			end
+			if idx >= 0 and idx < count then
+				return obj:getContainerByIndex(idx)
+			end
+		end
+	end
+	if obj.getItemContainer then
+		local c = obj:getItemContainer()
+		if c then
+			local ctype = c.getType and c:getType() or ""
+			if not ref.type or ref.type == "" or ctype == ref.type then
+				return c
+			end
+		end
+	end
+	return nil
+end
+
+--- Pack a container reference for MP BlindTransfer (Java ItemTransaction rejects over-cap containers).
+function USV.packContainerRef(container, character)
+	if not container then
+		return nil
+	end
+	if character and character.getInventory and container == character:getInventory() then
+		return { kind = "player" }
+	end
+	-- B42: player inv type is often "none" and object identity != getInventory(); use ownership.
+	local inChar = false
+	pcall(function()
+		inChar = container.isInCharacterInventory and container:isInCharacterInventory(character) or false
+	end)
+	local containing = nil
+	pcall(function()
+		containing = container.getContainingItem and container:getContainingItem() or nil
+	end)
+	if containing and containing.getID then
+		return { kind = "bag", itemID = containing:getID() }
+	end
+	if inChar then
+		return { kind = "player" }
+	end
+	local ctype = ""
+	pcall(function()
+		ctype = container.getType and tostring(container:getType() or "") or ""
+	end)
+	local parent, sq, coords, ownerId, kind, index = USV.getWorldContainerPackContext(container, character)
+	-- FloorContainer often has no parent; probe source grid only (do NOT use character tile fallback as floor).
+	if not sq then
+		pcall(function()
+			if container.getSourceGrid then
+				sq = container:getSourceGrid()
+			end
+		end)
+	end
+	if not sq and container.getSquare then
+		pcall(function()
+			sq = container:getSquare()
+		end)
+	end
+	-- Only explicit floor containers — never "parent==nil + character square" (that mislabels player inv).
+	if ctype == "floor" then
+		if not sq and character and character.getSquare then
+			pcall(function()
+				sq = character:getSquare()
+			end)
+		end
+		if not sq then
+			return nil
+		end
+		return {
+			kind = "floor",
+			x = sq:getX(),
+			y = sq:getY(),
+			z = sq:getZ() or 0,
+			type = "floor",
+			index = 0,
+		}
+	end
+	if not sq then
+		return nil
 	end
 	return {
 		kind = "world",
@@ -3115,6 +5825,11 @@ function USV.packContainerRef(container, character)
 		z = sq:getZ(),
 		type = ctype,
 		index = index,
+		usvOwner = ownerId,
+		usvKind = kind,
+		usvX = coords and coords.x or nil,
+		usvY = coords and coords.y or nil,
+		usvZ = coords and coords.z or nil,
 	}
 end
 
@@ -3151,13 +5866,19 @@ function USV.resolveContainerRef(ref, character)
 		return nil
 	end
 	if (ref.kind == "floor" or ref.type == "floor") and ref.x ~= nil and getCell then
+		-- B42 floor loot uses a synthetic ItemContainer("floor"), not square:getFloorContainer().
+		local fc = USV.getOrCreateFloorContainer(character)
+		if fc then
+			return fc
+		end
 		local sq = getCell():getGridSquare(ref.x, ref.y, ref.z or 0)
 		if sq and sq.getFloorContainer then
-			local fc = sq:getFloorContainer()
-			if fc then
-				return fc
+			local sqFc = sq:getFloorContainer()
+			if sqFc then
+				return sqFc
 			end
 		end
+		return nil
 	end
 	if ref.kind == "world" and ref.x ~= nil and getCell then
 		local sq = getCell():getGridSquare(ref.x, ref.y, ref.z or 0)
@@ -3173,33 +5894,23 @@ function USV.resolveContainerRef(ref, character)
 		if sq.getObjects then
 			local objects = sq:getObjects()
 			if objects then
-				for i = 0, objects:size() - 1 do
-					local obj = objects:get(i)
-					if obj and obj.getContainerCount then
-						local count = obj:getContainerCount() or 0
-						if count > 0 then
-							local idx = ref.index or 0
-							local c = obj:getContainerByIndex(idx)
+				if ref.usvOwner or ref.usvKind or ref.usvX ~= nil then
+					for i = 0, objects:size() - 1 do
+						local obj = objects:get(i)
+						if USV.worldObjectMatchesContainerRef(obj, ref) then
+							local c = USV.containerFromWorldObject(obj, ref)
 							if c then
-								local ctype = c.getType and c:getType() or ""
-								if not ref.type or ref.type == "" or ctype == ref.type then
-									return c
-								end
-							end
-							for ci = 0, count - 1 do
-								local c2 = obj:getContainerByIndex(ci)
-								if c2 and c2.getType and c2:getType() == ref.type then
-									return c2
-								end
-							end
-						end
-					elseif obj and obj.getItemContainer then
-						local c = obj:getItemContainer()
-						if c then
-							local ctype = c.getType and c:getType() or ""
-							if not ref.type or ref.type == "" or ctype == ref.type then
 								return c
 							end
+						end
+					end
+				end
+				for i = 0, objects:size() - 1 do
+					local obj = objects:get(i)
+					if not ref.usvOwner and not ref.usvKind and ref.usvX == nil then
+						local c = USV.containerFromWorldObject(obj, ref)
+						if c then
+							return c
 						end
 					end
 				end
@@ -3213,24 +5924,240 @@ function USV.resolveContainerRef(ref, character)
 	return nil
 end
 
---- Server/SP Blind transfer — bypasses Java capacity hard-cap (100).
-function USV.doBlindTransfer(character, item, srcContainer, destContainer)
-	if not item or not destContainer then
+--- B42: loot "floor" is a synthetic ItemContainer (see ISInventoryPage.GetFloorContainer),
+--- not IsoGridSquare:getFloorContainer().
+function USV.getOrCreateFloorContainer(character)
+	local playerNum = 0
+	pcall(function()
+		if character and character.getPlayerNum then
+			playerNum = character:getPlayerNum() or 0
+		end
+	end)
+	if ISInventoryPage and ISInventoryPage.GetFloorContainer then
+		local ok, fc = pcall(function()
+			return ISInventoryPage.GetFloorContainer(playerNum)
+		end)
+		if ok and fc then
+			return fc
+		end
+	end
+	USV._floorContainers = USV._floorContainers or {}
+	local key = (tonumber(playerNum) or 0) + 1
+	if not USV._floorContainers[key] then
+		local fc = nil
+		pcall(function()
+			if ItemContainer and ItemContainer.new then
+				fc = ItemContainer.new("floor", nil, nil)
+				if fc and fc.setExplored then
+					fc:setExplored(true)
+				end
+			end
+		end)
+		USV._floorContainers[key] = fc
+	end
+	return USV._floorContainers[key]
+end
+
+--- Place an item onto a floor square the vanilla way (synthetic floor container + WorldItem).
+--- Returns true only when the item is confirmed on the floor / world.
+function USV.placeItemOnFloorSquare(character, item, dropSq, floorContainer)
+	if not item or not dropSq then
 		return false
 	end
-	if not USV.isUnlimitedContainer(destContainer) then
+	local fc = floorContainer or USV.getOrCreateFloorContainer(character)
+	if not fc then
+		return false
+	end
+	-- Only strip from character inventory when the item is actually there.
+	-- USV→floor items are already removed from the vault; removeItemOnCharacter
+	-- returning false must not abort WorldItem placement.
+	local inCharInv = false
+	pcall(function()
+		local inv = character and character.getInventory and character:getInventory() or nil
+		inCharInv = inv and inv.contains and inv:contains(item) or false
+	end)
+	if inCharInv and character and ISTransferAction and ISTransferAction.removeItemOnCharacter then
+		local ok, res = pcall(function()
+			return ISTransferAction:removeItemOnCharacter(character, item)
+		end)
+		if ok and res == false then
+			return false
+		end
+	end
+	pcall(function()
+		if fc.DoAddItemBlind then
+			fc:DoAddItemBlind(item)
+		elseif fc.DoAddItem then
+			fc:DoAddItem(item)
+		elseif fc.AddItem then
+			fc:AddItem(item)
+		end
+	end)
+	local dropX, dropY, dropZ = 0.5, 0.5, 0.0
+	if ISTransferAction and ISTransferAction.GetDropItemOffset then
+		pcall(function()
+			dropX, dropY, dropZ = ISTransferAction.GetDropItemOffset(character, dropSq, item)
+		end)
+	end
+	pcall(function()
+		if dropSq.AddWorldInventoryItem then
+			dropSq:AddWorldInventoryItem(item, dropX, dropY, dropZ)
+		end
+	end)
+	local okPlace = false
+	pcall(function()
+		-- Visible floor loot requires a WorldItem; synthetic floorCont:contains is not enough.
+		okPlace = item.getWorldItem and item:getWorldItem() ~= nil
+	end)
+	if okPlace and isServer and isServer() then
+		pcall(function()
+			local wi = item:getWorldItem()
+			if wi then
+				if wi.transmitCompleteItemToClients then
+					wi:transmitCompleteItemToClients()
+				end
+				if dropSq.transmitAddObjectToSquare then
+					dropSq:transmitAddObjectToSquare(wi)
+				end
+			end
+		end)
+		pcall(function()
+			if sendAddItemToContainer and fc then
+				sendAddItemToContainer(fc, item)
+			end
+		end)
+	end
+	return okPlace
+end
+
+--- Server/SP Blind transfer — bypasses Java capacity hard-cap (100) for USV containers.
+--- opts.destFloorSq: floor drop square when dest FloorContainer may be missing on dedicated.
+function USV.doBlindTransfer(character, item, srcContainer, destContainer, opts)
+	opts = opts or {}
+	local destFloorSq = opts.destFloorSq
+	if not item then
+		return false
+	end
+	local destType = destContainer and destContainer.getType and destContainer:getType() or ""
+	local wantFloor = destFloorSq ~= nil or destType == "floor"
+	if not destContainer and not wantFloor then
+		return false
+	end
+	local destUSV = destContainer and USV.isUnlimitedContainer(destContainer) or false
+	local srcUSV = srcContainer and USV.isUnlimitedContainer(srcContainer) or false
+	if not destUSV and not srcUSV then
 		return false
 	end
 	if USV.isUSVFurnitureItem(item) then
 		return false
 	end
-	USV.ensureContainerCapacity(destContainer)
+	if destUSV then
+		USV.ensureContainerCapacity(destContainer)
+	end
+	if srcUSV then
+		USV.ensureContainerCapacity(srcContainer)
+	end
 	local srcType = srcContainer and srcContainer.getType and srcContainer:getType() or ""
 	if srcType == "TradeUI" then
 		return false
 	end
-	if destContainer.isItemAllowed and not destContainer:isItemAllowed(item) then
+	-- Floor drop: remove from USV then place WorldItem (success = getWorldItem only).
+	if wantFloor then
+		local floorCont = (destType == "floor" and destContainer) or USV.getOrCreateFloorContainer(character)
+		local dropSq = destFloorSq
+		if not dropSq and character and character.getSquare then
+			pcall(function()
+				dropSq = character:getSquare()
+			end)
+		end
+		if floorCont and ISTransferAction and ISTransferAction.getNotFullFloorSquare and character and item then
+			pcall(function()
+				local better = ISTransferAction:getNotFullFloorSquare(character, item, floorCont)
+				if better then
+					dropSq = better
+				end
+			end)
+		end
+		if not floorCont or not dropSq or not srcContainer then
+			return false
+		end
+		-- Already on floor (e.g. duplicate command): treat as success, still scrub USV.
+		local alreadyWI = false
+		pcall(function()
+			alreadyWI = item.getWorldItem and item:getWorldItem() ~= nil
+		end)
+		if alreadyWI then
+			if srcUSV and srcContainer and srcContainer.contains and srcContainer:contains(item) then
+				pcall(function()
+					srcContainer:DoRemoveItem(item)
+				end)
+				if isServer and isServer() and sendRemoveItemFromContainer then
+					pcall(function()
+						sendRemoveItemFromContainer(srcContainer, item)
+					end)
+				end
+				local srcObj = USV.getContainerWorldObject(srcContainer)
+				if srcObj then
+					USV.syncEntityContentsSnapshot(srcObj)
+				end
+			end
+			return true
+		end
+		-- Remove from USV first, then place; rollback if WorldItem never appears.
+		if srcType ~= "floor" then
+			pcall(function()
+				srcContainer:DoRemoveItem(item)
+			end)
+			if isServer and isServer() and sendRemoveItemFromContainer then
+				pcall(function()
+					sendRemoveItemFromContainer(srcContainer, item)
+				end)
+			end
+		end
+		local added = USV.placeItemOnFloorSquare(character, item, dropSq, floorCont)
+		local hasWI = false
+		pcall(function()
+			hasWI = item.getWorldItem and item:getWorldItem() ~= nil
+		end)
+		added = added and hasWI
+		if not added and srcUSV then
+			pcall(function()
+				if type(USV._rawDoAddItemBlind) == "function" then
+					USV._rawDoAddItemBlind(srcContainer, item)
+				elseif srcContainer.DoAddItemBlind then
+					srcContainer:DoAddItemBlind(item)
+				end
+			end)
+			if isServer and isServer() and sendAddItemToContainer then
+				pcall(function()
+					sendAddItemToContainer(srcContainer, item)
+				end)
+			end
+		end
+		if added or srcUSV then
+			local srcObj = srcUSV and USV.getContainerWorldObject(srcContainer) or nil
+			if srcObj then
+				USV.syncEntityContentsSnapshot(srcObj)
+			end
+		end
+		if added then
+			if ISInventoryPage then
+				ISInventoryPage.renderDirty = true
+			end
+		end
+		return added
+	end
+
+	if destContainer and destContainer.isItemAllowed and not destContainer:isItemAllowed(item) then
 		return false
+	end
+	if srcContainer and srcContainer.isRemoveItemAllowed then
+		local okRem, canRem = pcall(function()
+			return srcContainer:isRemoveItemAllowed(item)
+		end)
+		if okRem and not canRem and srcType ~= "floor" and not (item.getWorldItem and item:getWorldItem() ~= nil) then
+			return false
+		end
 	end
 	local containsItem = false
 	if srcContainer then
@@ -3242,7 +6169,7 @@ function USV.doBlindTransfer(character, item, srcContainer, destContainer)
 		return false
 	end
 
-	-- Handle floor world inventory object removal
+	-- Handle floor world inventory object removal (floor → USV / other).
 	local worldItem = nil
 	pcall(function()
 		worldItem = item.getWorldItem and item:getWorldItem() or nil
@@ -3318,32 +6245,60 @@ function USV.doBlindTransfer(character, item, srcContainer, destContainer)
 	end
 
 	local added = false
-	if type(USV._rawDoAddItemBlind) == "function" then
-		local ok, res = pcall(USV._rawDoAddItemBlind, destContainer, item)
-		added = ok and res ~= nil
+	if destUSV then
+		if type(USV._rawDoAddItemBlind) == "function" then
+			local ok, res = pcall(USV._rawDoAddItemBlind, destContainer, item)
+			added = ok and res ~= nil
+		end
+		if not added then
+			pcall(function()
+				destContainer:DoAddItemBlind(item)
+				added = true
+			end)
+		end
+		if isServer and isServer() and added and sendAddItemToContainer then
+			pcall(function()
+				sendAddItemToContainer(destContainer, item)
+			end)
+		end
+	else
+		if destContainer.DoAddItem then
+			local ok, res = pcall(destContainer.DoAddItem, destContainer, item)
+			added = ok and res ~= nil
+		end
+		if not added and destContainer.AddItem then
+			local ok, res = pcall(destContainer.AddItem, destContainer, item)
+			added = ok and res ~= nil
+		end
+		if isServer and isServer() and added and sendAddItemToContainer then
+			pcall(function()
+				sendAddItemToContainer(destContainer, item)
+			end)
+		end
 	end
-	if not added then
-		pcall(function()
-			destContainer:DoAddItemBlind(item)
-			added = true
-		end)
-	end
-	if isServer and isServer() and added and sendAddItemToContainer then
-		pcall(function()
-			sendAddItemToContainer(destContainer, item)
-		end)
+	if added then
 	end
 	pcall(function()
 		if srcContainer and srcContainer.setDrawDirty then
 			srcContainer:setDrawDirty(true)
 			srcContainer:setHasBeenLooted(true)
 		end
-		if destContainer.setDrawDirty then
+		if destContainer and destContainer.setDrawDirty then
 			destContainer:setDrawDirty(true)
 		end
 	end)
 	if ISInventoryPage then
 		ISInventoryPage.renderDirty = true
+	end
+	if added then
+		local destObj = destUSV and USV.getContainerWorldObject(destContainer) or nil
+		local srcObj = srcUSV and USV.getContainerWorldObject(srcContainer) or nil
+		if destObj then
+			USV.syncEntityContentsSnapshot(destObj)
+		end
+		if srcObj and srcObj ~= destObj then
+			USV.syncEntityContentsSnapshot(srcObj)
+		end
 	end
 	return added
 end
@@ -3352,10 +6307,88 @@ function USV.packBlindTransferArgs(character, item, srcContainer, destContainer)
 	if not item or not item.getID then
 		return nil
 	end
+	local src = USV.packContainerRef(srcContainer, character)
+	local hasWI = false
+	pcall(function()
+		hasWI = item.getWorldItem and item:getWorldItem() ~= nil
+	end)
+	-- Inventory items must never be sent as floor (parent-less inv + character tile mispack).
+	if (not hasWI) and character and character.getInventory then
+		local inPlayer = false
+		pcall(function()
+			inPlayer = character:getInventory():contains(item)
+		end)
+		if not inPlayer and srcContainer and srcContainer.contains then
+			pcall(function()
+				inPlayer = srcContainer:contains(item)
+					and srcContainer.isInCharacterInventory
+					and srcContainer:isInCharacterInventory(character)
+			end)
+		end
+		if inPlayer and (not src or src.kind == "floor" or src.kind == nil) then
+			local containing = nil
+			pcall(function()
+				containing = srcContainer and srcContainer.getContainingItem and srcContainer:getContainingItem() or nil
+			end)
+			if containing and containing.getID then
+				src = { kind = "bag", itemID = containing:getID() }
+			else
+				src = { kind = "player" }
+			end
+		end
+	end
+	-- Floor / world loot: FloorContainer often has no parent; pin coords from the WorldItem.
+	if (not src or src.x == nil) and hasWI then
+		local sq = nil
+		pcall(function()
+			local wi = item.getWorldItem and item:getWorldItem() or nil
+			sq = wi and wi.getSquare and wi:getSquare() or nil
+		end)
+		if sq then
+			src = {
+				kind = "floor",
+				x = sq:getX(),
+				y = sq:getY(),
+				z = sq:getZ() or 0,
+				type = "floor",
+				index = 0,
+			}
+		end
+	elseif (not src or src.x == nil) and srcContainer then
+		local ctype = ""
+		pcall(function()
+			ctype = srcContainer.getType and tostring(srcContainer:getType() or "") or ""
+		end)
+		if ctype == "floor" then
+			local sq = nil
+			pcall(function()
+				sq = srcContainer.getSourceGrid and srcContainer:getSourceGrid() or nil
+			end)
+			if not sq and character and character.getSquare then
+				pcall(function()
+					sq = character:getSquare()
+				end)
+			end
+			if sq then
+				src = {
+					kind = "floor",
+					x = sq:getX(),
+					y = sq:getY(),
+					z = sq:getZ() or 0,
+					type = "floor",
+					index = 0,
+				}
+			end
+		end
+	end
+	local dest = USV.packContainerRef(destContainer, character)
+	if not src or not dest then
+		return nil
+	end
 	return {
 		itemID = item:getID(),
-		src = USV.packContainerRef(srcContainer, character),
-		dest = USV.packContainerRef(destContainer, character),
+		src = src,
+		dest = dest,
 	}
 end
 
@@ -3366,7 +6399,9 @@ function USV.clientBlindTransferNow(character, item, srcContainer, destContainer
 	if not character or not item or not srcContainer or not destContainer then
 		return false
 	end
-	if not USV.isUnlimitedContainer(destContainer) then
+	local destUSV = USV.isUnlimitedContainer(destContainer)
+	local srcUSV = srcContainer and USV.isUnlimitedContainer(srcContainer) or false
+	if not destUSV and not srcUSV then
 		return false
 	end
 	if USV.isUSVFurnitureItem(item) then
@@ -3384,14 +6419,36 @@ function USV.clientBlindTransferNow(character, item, srcContainer, destContainer
 		action.usvSentIDs[itemID] = true
 	end
 	local args = USV.packBlindTransferArgs(character, item, srcContainer, destContainer)
-	if args and sendClientCommand then
+	if not args then
+		return false
+	end
+	-- Listen-server host: apply once locally. Do NOT also sendClientCommand (that double-applies
+	-- and can destroy WorldItems when USV→floor runs twice).
+	if isServer and isServer() then
+		local opts = nil
+		local destType = ""
+		pcall(function()
+			destType = destContainer.getType and tostring(destContainer:getType() or "") or ""
+		end)
+		if destType == "floor" and character and character.getSquare then
+			opts = { destFloorSq = character:getSquare() }
+		end
+		return USV.doBlindTransfer(character, item, srcContainer, destContainer, opts)
+	end
+	if sendClientCommand then
 		sendClientCommand(character, "USV", "BlindTransfer", args)
 	end
-	-- Host / SP authority shares world objects with the client view.
-	if isServer and isServer() then
-		return USV.doBlindTransfer(character, item, srcContainer, destContainer)
-	end
 	return true
+end
+
+function USV.transferInvolvesUnlimited(srcContainer, destContainer)
+	if srcContainer and USV.isUnlimitedContainer(srcContainer) then
+		return true
+	end
+	if destContainer and USV.isUnlimitedContainer(destContainer) then
+		return true
+	end
+	return false
 end
 
 --- Vanilla-like transfer validation for USV destinations (no weight / item-count caps).
@@ -3409,7 +6466,12 @@ function USV.transferIsValidUnlimited(self)
 	if not self.srcContainer then
 		return false
 	end
-	USV.ensureContainerCapacity(self.destContainer)
+	if USV.isUnlimitedContainer(self.srcContainer) then
+		USV.ensureContainerCapacity(self.srcContainer)
+	end
+	if USV.isUnlimitedContainer(self.destContainer) then
+		USV.ensureContainerCapacity(self.destContainer)
+	end
 	self.dontAdd = false
 	local srcType = self.srcContainer.getType and self.srcContainer:getType() or ""
 	local containsItem = false
@@ -3427,7 +6489,10 @@ function USV.transferIsValidUnlimited(self)
 	end
 	if isClient and isClient() then
 		-- Skip ItemNumbersLimitPerContainer and hasRoomFor (Java cap is 100; weight may already exceed it).
-		-- Also skip isItemTransactionConsistent — we use BlindTransfer instead of ItemTransaction.
+		-- Still enforce fridge food rules and other isItemAllowed checks.
+		if self.destContainer.isItemAllowed and not self.destContainer:isItemAllowed(self.item) then
+			return false
+		end
 		return true
 	end
 	if self.destContainer.isExistYet and self.srcContainer.isExistYet then
@@ -3475,7 +6540,11 @@ function USV.installTransferHooks()
 					src = sq:getFloorContainer()
 				end
 			end
-			return prevUtil(character, item, src, destContainer, time)
+			local t = time
+			if USV.transferInvolvesUnlimited(src, destContainer) then
+				t = 0
+			end
+			return prevUtil(character, item, src, destContainer, t)
 		end
 		ISInventoryTransferUtil._USV_Wrapped = true
 	end
@@ -3493,7 +6562,11 @@ function USV.installTransferHooks()
 					src = sq:getFloorContainer()
 				end
 			end
-			return prevNewAction(self, character, item, src, destContainer, time)
+			local t = time
+			if USV.transferInvolvesUnlimited(src, destContainer) then
+				t = 0
+			end
+			return prevNewAction(self, character, item, src, destContainer, t)
 		end
 		ISInventoryTransferAction._USV_NewWrapped = true
 	end
@@ -3503,8 +6576,37 @@ function USV.installTransferHooks()
 		if not ISInventoryTransferAction._USV_IsValidWrapped then
 			local prev = ISInventoryTransferAction.isValid
 			ISInventoryTransferAction.isValid = function(self)
-				if self and self.destContainer and USV.isUnlimitedContainer(self.destContainer) then
-					USV.ensureContainerCapacity(self.destContainer)
+				if self and self.item and self.destContainer then
+					local blocked, why = USV.usvFurnitureBlockedInContainer(self.item, self.destContainer)
+					if blocked then
+						return false
+					end
+					if USV.useFixedCarryWeight(self.item) and not USV.isUnlimitedContainer(self.destContainer) then
+						local destType = ""
+						local allowed, room, iw = nil, nil, nil
+						pcall(function()
+							destType = self.destContainer.getType and tostring(self.destContainer:getType() or "") or ""
+						end)
+						pcall(function()
+							allowed = self.destContainer.isItemAllowed and self.destContainer:isItemAllowed(self.item)
+						end)
+						pcall(function()
+							room = self.destContainer.hasRoomFor and self.destContainer:hasRoomFor(self.item)
+						end)
+						pcall(function()
+							iw = self.item.getWeight and self.item:getWeight() or nil
+						end)
+						if allowed == false or room == false then
+						end
+					end
+				end
+				if self and USV.transferInvolvesUnlimited(self.srcContainer, self.destContainer) then
+					if USV.isUnlimitedContainer(self.srcContainer) then
+						USV.ensureContainerCapacity(self.srcContainer)
+					end
+					if USV.isUnlimitedContainer(self.destContainer) then
+						USV.ensureContainerCapacity(self.destContainer)
+					end
 					return USV.transferIsValidUnlimited(self)
 				end
 				return prev(self)
@@ -3517,7 +6619,7 @@ function USV.installTransferHooks()
 		if not ISInventoryTransferAction._USV_StartWrapped then
 			local prevStart = ISInventoryTransferAction.start
 			ISInventoryTransferAction.start = function(self)
-				if isClient and isClient() and self and self.destContainer and USV.isUnlimitedContainer(self.destContainer)
+				if isClient and isClient() and self and USV.transferInvolvesUnlimited(self.srcContainer, self.destContainer)
 					and self.item and self.srcContainer and self.character then
 					if self.isAlreadyTransferred and self:isAlreadyTransferred(self.item) then
 						self.selectedContainer = nil
@@ -3553,7 +6655,7 @@ function USV.installTransferHooks()
 							self.action:setWaitForFinished(false)
 						end
 						if self.action.setTime then
-							self.action:setTime(1)
+							self.action:setTime(0)
 						end
 					end
 					return
@@ -3568,7 +6670,7 @@ function USV.installTransferHooks()
 		if not ISInventoryTransferAction._USV_UpdateWrapped then
 			local prevUpdate = ISInventoryTransferAction.update
 			ISInventoryTransferAction.update = function(self)
-				if self and self.destContainer and USV.isUnlimitedContainer(self.destContainer) then
+				if self and USV.transferInvolvesUnlimited(self.srcContainer, self.destContainer) then
 					if self.usvBlindDone and isClient and isClient() then
 						if not self.usvBlindForced then
 							self.usvBlindForced = true
@@ -3612,7 +6714,7 @@ function USV.installTransferHooks()
 			local prevPerform = ISInventoryTransferAction.perform
 			ISInventoryTransferAction.perform = function(self)
 				if not (isClient and isClient() and self and self.usvBlindDone
-					and self.destContainer and USV.isUnlimitedContainer(self.destContainer)) then
+					and USV.transferInvolvesUnlimited(self.srcContainer, self.destContainer)) then
 					return prevPerform(self)
 				end
 				self:checkQueueList()
@@ -3628,12 +6730,14 @@ function USV.installTransferHooks()
 					if queuedItem and queuedItem.items then
 						for _, item in ipairs(queuedItem.items) do
 							self.item = item
-							if self:isValid() then
-								local srcType = self.srcContainer and self.srcContainer.getType and self.srcContainer:getType() or ""
-								local hasItem = self.srcContainer and self.srcContainer:contains(item)
-								if not hasItem and (srcType == "floor" or (item.getWorldItem and item:getWorldItem() ~= nil)) then
-									hasItem = true
-								end
+							local valid = self:isValid()
+							local srcType = self.srcContainer and self.srcContainer.getType and self.srcContainer:getType() or ""
+							local hasItem = self.srcContainer and self.srcContainer:contains(item)
+							local hasWI = item.getWorldItem and item:getWorldItem() ~= nil
+							if not hasItem and (srcType == "floor" or hasWI) then
+								hasItem = true
+							end
+							if valid then
 								if hasItem then
 									USV.clientBlindTransferNow(self.character, item, self.srcContainer, self.destContainer, self)
 								end
@@ -3710,7 +6814,7 @@ function USV.installTransferHooks()
 					end
 					return
 				end
-				if self and self.destContainer and USV.isUnlimitedContainer(self.destContainer)
+				if self and USV.transferInvolvesUnlimited(self.srcContainer, self.destContainer)
 					and not (isClient and isClient()) then
 					USV.doBlindTransfer(self.character, item, self.srcContainer, self.destContainer)
 					return
@@ -3724,7 +6828,7 @@ function USV.installTransferHooks()
 		if not ISTransferAction._USV_TransferWrapped then
 			local prevTransfer = ISTransferAction.transferItem
 			ISTransferAction.transferItem = function(self, character, item, srcContainer, destContainer, dropSquare)
-				if not (destContainer and item and USV.isUnlimitedContainer(destContainer)) then
+				if not (item and USV.transferInvolvesUnlimited(srcContainer, destContainer)) then
 					return prevTransfer(self, character, item, srcContainer, destContainer, dropSquare)
 				end
 				-- Trade paths keep vanilla.
@@ -3733,6 +6837,15 @@ function USV.installTransferHooks()
 				if destType == "TradeUI" or srcType == "TradeUI" then
 					USV.ensureContainerCapacity(destContainer)
 					return prevTransfer(self, character, item, srcContainer, destContainer, dropSquare)
+				end
+				-- Floor dest must create a WorldItem; DoAddItemBlind into synthetic floor = vanish.
+				if destType == "floor" or dropSquare ~= nil then
+					local opts = { destFloorSq = dropSquare }
+					local ok = USV.doBlindTransfer(character, item, srcContainer, destContainer, opts)
+					return ok and item or nil
+				end
+				if destContainer.isItemAllowed and not destContainer:isItemAllowed(item) then
+					return nil
 				end
 				USV.ensureContainerCapacity(destContainer)
 				-- If transferring from floor/world item, remove world item first
@@ -3832,11 +6945,19 @@ function USV.installTransferHooks()
 			if dest and instanceof and instanceof(dest, "InventoryContainer") and dest.getInventory then
 				dest = dest:getInventory()
 			end
-			if dest and USV.isUnlimitedContainer(dest) then
-				USV.ensureContainerCapacity(dest)
-				-- Bypass vanilla getCapacity/hasRoomFor gate (Java field may be 100 while weight > 100).
+			local src = srcContainer
+			if src and instanceof and instanceof(src, "InventoryContainer") and src.getInventory then
+				src = src:getInventory()
+			end
+			if USV.transferInvolvesUnlimited(src, dest) then
+				if USV.isUnlimitedContainer(src) then
+					USV.ensureContainerCapacity(src)
+				end
+				if USV.isUnlimitedContainer(dest) then
+					USV.ensureContainerCapacity(dest)
+				end
 				if ISTimedActionQueue and ISInventoryTransferAction then
-					ISTimedActionQueue.add(ISInventoryTransferAction:new(character, item, srcContainer, dest, 10))
+					ISTimedActionQueue.add(ISInventoryTransferAction:new(character, item, srcContainer, dest, 0))
 					return
 				end
 			end
@@ -3854,7 +6975,16 @@ function USV.installTransferHooks()
 				end
 				if dest and USV.isUnlimitedContainer(dest) then
 					USV.ensureContainerCapacity(dest)
-					return true
+					if not items then
+						return false
+					end
+					for i = 1, #items do
+						local it = items[i]
+						if it and dest.isItemAllowed and dest:isItemAllowed(it) then
+							return true
+						end
+					end
+					return false
 				end
 				return prevRoom(playerObj, container, items)
 			end
@@ -3864,6 +6994,16 @@ function USV.installTransferHooks()
 	if ISInventoryPane and type(ISInventoryPane.canPutIn) == "function" and not ISInventoryPane._USV_CanPutInWrapped then
 		local prevCanPutIn = ISInventoryPane.canPutIn
 		ISInventoryPane.canPutIn = function(self)
+			if self.inventory and USV.containerIsBagInventory(self.inventory) then
+				local dragging = ISInventoryPane.getActualItems(ISMouseDrag.dragging)
+				if dragging then
+					for _, v in ipairs(dragging) do
+						if USV.isUSVFurnitureItem(v) or USV.useFixedCarryWeight(v) then
+							return false
+						end
+					end
+				end
+			end
 			if self.inventory and USV.isUnlimitedContainer(self.inventory) then
 				USV.ensureContainerCapacity(self.inventory)
 				local playerObj = getSpecificPlayer(self.player)
@@ -3899,6 +7039,16 @@ function USV.installTransferHooks()
 		local prevPageCanPutIn = ISInventoryPage.canPutIn
 		ISInventoryPage.canPutIn = function(self)
 			local container = self.mouseOverButton and self.mouseOverButton.inventory or nil
+			if container and USV.containerIsBagInventory(container) then
+				local dragging = ISInventoryPane.getActualItems(ISMouseDrag.dragging)
+				if dragging then
+					for _, item in ipairs(dragging) do
+						if USV.isUSVFurnitureItem(item) or USV.useFixedCarryWeight(item) then
+							return false
+						end
+					end
+				end
+			end
 			if container and USV.isUnlimitedContainer(container) then
 				USV.ensureContainerCapacity(container)
 				local playerObj = getSpecificPlayer(self.player)
@@ -4144,23 +7294,6 @@ function USV.installMoveableHooks()
 		return false
 	end
 
-	-- ISMoveableCursor lists pickups via new(sprite) + isMoveable, so USV sprites must stay moveable here.
-	-- Only isMoveable is forced (appearance sprites include vanilla fridges/lockers); weight/tool
-	-- overrides live in fromObject, which checks the object. Vanilla moveability is kept so
-	-- canPickUpMoveableInternal can refuse non-USV objects that vanilla would not allow.
-	if type(ISMoveableSpriteProps.new) == "function" and not ISMoveableSpriteProps._USV_NewWrapped then
-		local prevNew = ISMoveableSpriteProps.new
-		ISMoveableSpriteProps.new = function(sprite)
-			local s = prevNew(sprite)
-			if s and s.spriteName and USV.resolveSpriteKind(s.spriteName) then
-				s._USV_vanillaMoveable = s.isMoveable and true or false
-				s.isMoveable = true
-			end
-			return s
-		end
-		ISMoveableSpriteProps._USV_NewWrapped = true
-	end
-
 	if type(ISMoveableSpriteProps.fromObject) == "function" and not ISMoveableSpriteProps._USV_FromObjectWrapped then
 		local prevFromObject = ISMoveableSpriteProps.fromObject
 		ISMoveableSpriteProps.fromObject = function(obj)
@@ -4182,7 +7315,7 @@ function USV.installMoveableHooks()
 	if type(ISMoveableSpriteProps.hasRequiredSkill) == "function" and not ISMoveableSpriteProps._USV_SkillWrapped then
 		local prevSkill = ISMoveableSpriteProps.hasRequiredSkill
 		ISMoveableSpriteProps.hasRequiredSkill = function(self, _player, _mode)
-			if (_mode == "pickup" or _mode == "place") and (USV.resolveSpriteKind(self.spriteName) or (self.object and USV.isUSVMoveableObject(self.object, self.spriteName))) then
+			if (_mode == "pickup" or _mode == "place") and self.object and USV.isUSVMoveableObject(self.object, self.spriteName) then
 				return true
 			end
 			return prevSkill(self, _player, _mode)
@@ -4193,7 +7326,7 @@ function USV.installMoveableHooks()
 	if type(ISMoveableSpriteProps.hasTool) == "function" and not ISMoveableSpriteProps._USV_ToolWrapped then
 		local prevTool = ISMoveableSpriteProps.hasTool
 		ISMoveableSpriteProps.hasTool = function(self, _player, _mode)
-			if (_mode == "pickup" or _mode == "place") and (USV.resolveSpriteKind(self.spriteName) or (self.object and USV.isUSVMoveableObject(self.object, self.spriteName))) then
+			if (_mode == "pickup" or _mode == "place") and self.object and USV.isUSVMoveableObject(self.object, self.spriteName) then
 				return true
 			end
 			return prevTool(self, _player, _mode)
@@ -4223,7 +7356,7 @@ function USV.installMoveableHooks()
 		local prevInfoGeneral = ISMoveableSpriteProps.getInfoPanelFlagsGeneral
 		ISMoveableSpriteProps.getInfoPanelFlagsGeneral = function(self, _square, _object, _player, _mode)
 			local res = prevInfoGeneral(self, _square, _object, _player, _mode)
-			if _mode == "pickup" and (USV.isUSVMoveableObject(_object, self.spriteName) or (self.spriteName and USV.resolveSpriteKind(self.spriteName))) then
+			if _mode == "pickup" and USV.isUSVMoveableObject(_object, self.spriteName) then
 				if InfoPanelFlags then
 					InfoPanelFlags.weight = tostring(USV.MOVEABLE_CARRY_WEIGHT or 1)
 				end
@@ -4236,6 +7369,8 @@ function USV.installMoveableHooks()
 	local prev = ISMoveableSpriteProps.canPickUpMoveableInternal
 	ISMoveableSpriteProps.canPickUpMoveableInternal = function(self, _character, _square, _object, _isMulti)
 		local isUSV = USV.isUSVMoveableObject(_object, self.spriteName)
+		if _object then
+		end
 		if isUSV then
 			-- nil object skips isObjectNoContainerOrEmpty; carry weight is fixed (contents ignored).
 			local oldWeight = self.weight
@@ -4252,10 +7387,6 @@ function USV.installMoveableHooks()
 			end
 			return true
 		end
-		if self._USV_vanillaMoveable == false then
-			-- Vanilla object sharing a USV sprite: only moveable because of the new() override.
-			return false
-		end
 		return prev(self, _character, _square, _object, _isMulti)
 	end
 
@@ -4267,11 +7398,13 @@ function USV.installMoveableHooks()
 			end
 			if _item and USV.isUSVCarryItem(_item) then
 				local kind = "vault"
+				local ownerId = nil
 				pcall(function()
 					local md = _item:getModData()
 					kind = (md and md[USV.KIND_FLAG]) or USV.resolveSpriteKind(self.spriteName) or "vault"
+					ownerId = md and md[USV.OWNER_FLAG] or nil
 				end)
-				local ok = USV.canPlaceKind(kind, _character, _square, true)
+				local ok = USV.canPlaceKind(kind, _character, _square, ownerId ~= nil)
 				if not ok then
 					return false
 				end
@@ -4300,6 +7433,27 @@ function USV.installMoveableHooks()
 				appearanceId = USV.getObjectAppearanceId(_object)
 				-- Pull items out before TransferComponents / world-remove (destroy hooks would wipe them).
 				packs = USV.harvestContainerItems(_object)
+				local existingContentsId = USV.getEntityContentsId(_object)
+				if not existingContentsId or existingContentsId == "" then
+					existingContentsId = USV.newContentsId(ownerId, kind)
+				end
+				USV._pendingContentsId = existingContentsId
+				USV.writeContentsSnapshot(existingContentsId, packs, {
+					kind = kind,
+					ownerId = ownerId,
+					ownerName = USV.resolveOwnerUserName(ownerId, _character),
+				})
+				if isClient and isClient() and not (isServer and isServer()) and sendClientCommand and _character then
+					pcall(function()
+						sendClientCommand(_character, "USV", "SaveContents", {
+							id = existingContentsId,
+							kind = kind,
+							ownerId = ownerId,
+							ownerName = USV.resolveOwnerUserName(ownerId, _character),
+							packs = USV.packsToDescriptors(packs),
+						})
+					end)
+				end
 				local coords = USV.getLiveCoords(_object) or USV.getObjectCoords(_object)
 				USV.unregisterPlacement(kind, _object)
 				if ownerId then
@@ -4333,12 +7487,24 @@ function USV.installMoveableHooks()
 						md[USV.POS_X] = nil
 						md[USV.POS_Y] = nil
 						md[USV.POS_Z] = nil
+						if USV._pendingContentsId then
+							md[USV.CONTENTS_ID] = USV._pendingContentsId
+						end
 					end
 				end)
+				USV._pendingContentsId = nil
 				USV.storeCarryPacks(item, packs)
 				USV.makeMoveableWeightless(item)
 				pcall(function()
 					USV.purgeNestedFurnitureItems(item)
+				end)
+				USV.makeMoveableWeightless(item)
+				local gw, ga, gc, customW = nil, nil, nil, nil
+				pcall(function()
+					gw = item.getWeight and item:getWeight() or nil
+					ga = item.getActualWeight and item:getActualWeight() or nil
+					gc = item.getContentsWeight and item:getContentsWeight() or nil
+					customW = item.isCustomWeight and item:isCustomWeight() or nil
 				end)
 			elseif item and USV.isUSVCarryItem(item) then
 				USV.makeMoveableWeightless(item)
@@ -4355,6 +7521,10 @@ function USV.installMoveableHooks()
 			local kind = nil
 			local ownerId = nil
 			local appearanceId = nil
+			-- Must stay in outer scope: finishObj is a closure and cannot see block-locals.
+			local character = _character
+			local isRelocate = false
+			local contentsId = nil
 			local isUSV = _item and USV.isUSVCarryItem(_item)
 			if isUSV then
 				pcall(function()
@@ -4363,9 +7533,9 @@ function USV.installMoveableHooks()
 						kind = md[USV.KIND_FLAG] or USV.resolveSpriteKind(sprName) or "vault"
 						ownerId = md[USV.OWNER_FLAG]
 						appearanceId = md[USV.APPEARANCE_FLAG]
+						contentsId = md[USV.CONTENTS_ID]
 					end
 				end)
-				local character = _character
 				pcall(function()
 					local cont = _item.getContainer and _item:getContainer() or nil
 					local parent = cont and cont.getParent and cont:getParent() or nil
@@ -4373,7 +7543,8 @@ function USV.installMoveableHooks()
 						character = parent
 					end
 				end)
-				local ok, reason = USV.canPlaceKind(kind or "vault", character, _square, true)
+				isRelocate = ownerId ~= nil
+				local ok, reason = USV.canPlaceKind(kind or "vault", character, _square, isRelocate)
 				if not ok then
 					USV.notifyPlaceBlocked(character, kind or "vault", reason)
 					return nil
@@ -4394,6 +7565,23 @@ function USV.installMoveableHooks()
 				local objKind = USV.getObjectKind(obj) or kind or "vault"
 				local authorized = false
 				if USV.isAuthoritative() then
+					local placeSq = obj.getSquare and obj:getSquare() or _square
+					local canPlace, blockReason = USV.canPlaceKind(objKind, character, placeSq, isRelocate)
+					if not canPlace then
+						USV.notifyPlaceBlocked(character, objKind, blockReason)
+						-- Preserve JSON SoT: removeBuiltObject must not trigger deleteContentsSnapshot.
+						USV.beginPreserveMove()
+						USV.removeBuiltObject(obj)
+						USV.endPreserveMove()
+						USV.stripUntrustedFlags(obj)
+						if packs and _item then
+							USV.restoreCarryPacksToItem(_item, packs)
+						elseif contentsId and packs and USV.packsItemCount(packs) > 0 then
+							-- Carry item may already be consumed; keep durable JSON.
+							USV.writeContentsSnapshot(contentsId, packs, { kind = objKind, ownerId = ownerId })
+						end
+						return
+					end
 					local md = obj:getModData()
 					if md then
 						md[USV.FLAG] = true
@@ -4404,10 +7592,20 @@ function USV.installMoveableHooks()
 						if appearanceId then
 							md[USV.APPEARANCE_FLAG] = appearanceId
 						end
+						if contentsId then
+							md[USV.CONTENTS_ID] = contentsId
+						end
 					end
 					authorized = USV.authorizeObject(obj, objKind)
 					if not authorized then
-						-- Duplicate place while the original still exists: do not keep unlimited flags.
+						USV.beginPreserveMove()
+						if packs and _item then
+							USV.restoreCarryPacksToItem(_item, packs)
+							packs = nil
+						elseif contentsId and packs and USV.packsItemCount(packs) > 0 then
+							USV.writeContentsSnapshot(contentsId, packs, { kind = objKind, ownerId = ownerId })
+						end
+						USV.endPreserveMove()
 						USV.stripUntrustedFlags(obj)
 						USV.logError("place rejected duplicate USV " .. tostring(objKind))
 						return
@@ -4416,12 +7614,63 @@ function USV.installMoveableHooks()
 						USV.applyAppearance(obj, appearanceId, true)
 					end
 				else
-					authorized = true
+					authorized = ownerId ~= nil and (isRelocate or USV.isFlaggedObject(obj))
 				end
-				if packs then
-					local n = USV.depositContainerItems(obj, packs)
+				if authorized then
+					USV.applyObject(obj, true, objKind)
+					contentsId = contentsId or USV.getEntityContentsId(_item) or USV.getEntityContentsId(obj)
+					if contentsId then
+						USV.setEntityContentsId(obj, contentsId)
+					end
+					local packsWereEmpty = (not packs) or USV.packsItemCount(packs) <= 0
+					if packs and not packsWereEmpty then
+						USV.depositContainerItems(obj, packs)
+					end
+					local afterLive = 0
+					pcall(function()
+						local containers = USV.collectContainers(obj)
+						for _, c in ipairs(containers) do
+							local items = c.getItems and c:getItems() or nil
+							if items then
+								afterLive = afterLive + items:size()
+							end
+						end
+					end)
+					local dedicatedClient = isClient and isClient() and not (isServer and isServer())
+					-- SP / listen-host: restore from JSON when live refs were lost.
+					-- Dedicated client skips local spawn (server RestoreContents is SoT).
+					if contentsId and (packsWereEmpty or afterLive <= 0) and not dedicatedClient then
+						local restored = USV.restoreContentsFromSnapshot(obj, contentsId)
+						if restored > 0 then
+							packs = nil -- JSON is SoT; avoid duplicating remainders onto carry item
+						end
+					end
+					if packs and USV.packsItemCount(packs) > 0 and _item then
+						USV.restoreCarryPacksToItem(_item, packs)
+					end
+					if contentsId and not dedicatedClient then
+						USV.syncEntityContentsSnapshot(obj)
+					end
+					-- Dedicated MP client: server JSON is SoT — request refill.
+					if contentsId and dedicatedClient and sendClientCommand and character then
+						local sq = obj.getSquare and obj:getSquare() or _square
+						if sq then
+							pcall(function()
+								sendClientCommand(character, "USV", "RestoreContents", {
+									id = contentsId,
+									kind = objKind,
+									x = sq:getX(),
+									y = sq:getY(),
+									z = sq:getZ() or 0,
+								})
+							end)
+						end
+					end
+				elseif packs and _item then
+					USV.restoreCarryPacksToItem(_item, packs)
+				elseif contentsId and packs and USV.packsItemCount(packs) > 0 then
+					USV.writeContentsSnapshot(contentsId, packs, { kind = kind or "vault", ownerId = ownerId })
 				end
-				USV.applyObject(obj, true, objKind)
 			end
 			if isUSV then
 				if result then
@@ -4431,8 +7680,7 @@ function USV.installMoveableHooks()
 					if objects then
 						for i = 0, objects:size() - 1 do
 							local obj = objects:get(i)
-							local spr = USV.getSpriteNameFast(obj)
-							if spr and USV.resolveSpriteKind(spr) then
+							if USV.isUSVMoveableObject(obj, USV.getSpriteNameFast(obj)) then
 								finishObj(obj)
 								break
 							end
@@ -4449,15 +7697,23 @@ function USV.installMoveableHooks()
 	return true
 end
 
+local WEIGHT_HOOK_METHODS = {
+	"getWeight",
+	"getActualWeight",
+	"getUnequippedWeight",
+	"getContentsWeight",
+	"getEquippedWeight",
+	"getInventoryWeight",
+}
+
 local function patchInventoryItemWeightMethod(index, methodName)
 	local old = index[methodName]
 	if type(old) ~= "function" then
 		return false
 	end
 	index[methodName] = function(self, ...)
-		if USV.isUSVCarryItem(self) then
-			-- Contents are packed / ignored; furniture itself uses fixed carry weight.
-			if methodName == "getContentsWeight" then
+		if USV.useFixedCarryWeight(self) then
+			if methodName == "getContentsWeight" or methodName == "getInventoryWeight" then
 				return 0
 			end
 			return USV.MOVEABLE_CARRY_WEIGHT or 1
@@ -4467,25 +7723,59 @@ local function patchInventoryItemWeightMethod(index, methodName)
 	return true
 end
 
+local function installWeightHooksForClass(classObj, label)
+	if not classObj or not __classmetatables then
+		return false, "no_class"
+	end
+	local guardKey = "UnlimitedStorageVault_WeightHooks_" .. tostring(label)
+	if rawget(_G, guardKey) then
+		return true, "already"
+	end
+	local mt = __classmetatables[classObj]
+	if not mt or type(mt.__index) ~= "table" then
+		return false, "no_index"
+	end
+	local index = mt.__index
+	local patched = false
+	for i = 1, #WEIGHT_HOOK_METHODS do
+		if patchInventoryItemWeightMethod(index, WEIGHT_HOOK_METHODS[i]) then
+			patched = true
+		end
+	end
+	if not patched then
+		return false, "no_methods"
+	end
+	rawset(_G, guardKey, true)
+	return true, "patched"
+end
+
 function USV.installInventoryWeightHooks()
 	if rawget(_G, "UnlimitedStorageVault_InventoryWeightHooksInstalled") then
 		return true
 	end
-	if not InventoryItem or not InventoryItem.class or not __classmetatables then
+	if not __classmetatables then
 		return false
 	end
-	local mt = __classmetatables[InventoryItem.class]
-	if not mt or type(mt.__index) ~= "table" then
-		return false
+	local any = false
+	local details = {}
+	local classes = {
+		{ InventoryItem and InventoryItem.class, "InventoryItem" },
+		{ Moveable and Moveable.class, "Moveable" },
+		{ InventoryContainer and InventoryContainer.class, "InventoryContainer" },
+	}
+	for i = 1, #classes do
+		local cls, label = classes[i][1], classes[i][2]
+		if cls then
+			local ok, why = installWeightHooksForClass(cls, label)
+			details[label] = why
+			if ok then
+				any = true
+			end
+		else
+			details[label] = "missing"
+		end
 	end
-	local index = mt.__index
-	local patched = false
-	patched = patchInventoryItemWeightMethod(index, "getWeight") or patched
-	patched = patchInventoryItemWeightMethod(index, "getActualWeight") or patched
-	patched = patchInventoryItemWeightMethod(index, "getUnequippedWeight") or patched
-	patched = patchInventoryItemWeightMethod(index, "getContentsWeight") or patched
-	patched = patchInventoryItemWeightMethod(index, "getEquippedWeight") or patched
-	if not patched then
+	if not any then
 		return false
 	end
 	UnlimitedStorageVault_InventoryWeightHooksInstalled = true
@@ -4538,6 +7828,7 @@ function USV.installRemovalHooks()
 		local prevScrap = ISMoveableSpriteProps.scrapObjectInternal
 		ISMoveableSpriteProps.scrapObjectInternal = function(self, character, scrapDef, square, object, scrapResult, chance, perkName)
 			if object then
+				local contentsId = USV.getEntityContentsId(object)
 				USV.onWorldObjectRemoved(object, "scrap")
 				if isClient and isClient() and not (isServer and isServer()) and sendClientCommand and character then
 					local coords = USV.getLiveCoords(object) or USV.getObjectCoords(object)
@@ -4547,6 +7838,7 @@ function USV.installRemovalHooks()
 						y = coords and coords.y or nil,
 						z = coords and coords.z or 0,
 						kind = (md and md[USV.KIND_FLAG]) or USV.getObjectKind(object) or "vault",
+						contentsId = contentsId,
 					})
 				end
 			end
