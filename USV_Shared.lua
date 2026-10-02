@@ -732,9 +732,32 @@ function USV.isUSVSpriteObject(obj)
 	return USV.resolveSpriteKind(USV.getSpriteNameFast(obj)) ~= nil
 end
 
+--- World objects with no container (floors, walls) share the USV tile but are never the USV itself.
+function USV.isContainerlessWorldObject(obj)
+	if not obj or not instanceof or not instanceof(obj, "IsoObject") then
+		return false
+	end
+	local ok, has = pcall(function()
+		if obj.getContainerCount and (obj:getContainerCount() or 0) > 0 then
+			return true
+		end
+		if obj.getContainer and obj:getContainer() then
+			return true
+		end
+		if obj.getItemContainer and obj:getItemContainer() then
+			return true
+		end
+		return false
+	end)
+	return ok and not has
+end
+
 --- Capacity / transfer bypass: USV ModData / registry only (vanilla tiles may share sprites).
 function USV.isLegitimateUSVObject(obj)
 	if not obj then
+		return false
+	end
+	if USV.isContainerlessWorldObject(obj) then
 		return false
 	end
 	if unlimitedParentRegistry[obj] then
@@ -3962,6 +3985,10 @@ end
 
 function USV.isRegisteredPlacementObject(obj)
 	-- Match against live tile only so forged ModData POS cannot spoof placement.
+	-- The tile match alone also hits the floor under the USV, so require a container.
+	if USV.isContainerlessWorldObject(obj) then
+		return false
+	end
 	local coords = USV.getLiveCoords(obj)
 	if not coords then
 		return false
