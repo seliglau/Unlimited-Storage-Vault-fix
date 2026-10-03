@@ -5901,6 +5901,9 @@ function USV.packContainerRef(container, character)
 	if not sq then
 		return nil
 	end
+	-- Only tag the ref as USV when the parent really is one. A plain crate also has
+	-- coords, and usvX makes the server look for a USV object only, so it resolves nil.
+	local usvParent = ownerId ~= nil or kind ~= nil or (parent ~= nil and USV.isFlaggedObject(parent))
 	return {
 		kind = "world",
 		x = sq:getX(),
@@ -5908,11 +5911,11 @@ function USV.packContainerRef(container, character)
 		z = sq:getZ(),
 		type = ctype,
 		index = index,
-		usvOwner = ownerId,
-		usvKind = kind,
-		usvX = coords and coords.x or nil,
-		usvY = coords and coords.y or nil,
-		usvZ = coords and coords.z or nil,
+		usvOwner = usvParent and ownerId or nil,
+		usvKind = usvParent and kind or nil,
+		usvX = usvParent and coords and coords.x or nil,
+		usvY = usvParent and coords and coords.y or nil,
+		usvZ = usvParent and coords and coords.z or nil,
 	}
 end
 
@@ -5988,13 +5991,13 @@ function USV.resolveContainerRef(ref, character)
 						end
 					end
 				end
+				-- Also used when no USV matched: older clients tag plain containers (crates) with usvX.
+				-- The caller still checks which side is a trusted USV.
 				for i = 0, objects:size() - 1 do
 					local obj = objects:get(i)
-					if not ref.usvOwner and not ref.usvKind and ref.usvX == nil then
-						local c = USV.containerFromWorldObject(obj, ref)
-						if c then
-							return c
-						end
+					local c = USV.containerFromWorldObject(obj, ref)
+					if c then
+						return c
 					end
 				end
 			end

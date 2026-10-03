@@ -509,8 +509,46 @@ local function onClientCommand(module, command, player, args)
 		return
 	end
 	local item = findItemById(src, args.itemID, player, args.src)
+	if not item and src and args.src and args.src.kind == "world" and args.src.x ~= nil then
+		-- Stacked crates share one tile and type, and the ref has no way to tell them apart,
+		-- so resolveContainerRef returns the first one. Look in the other non-USV containers there.
+		local sq = getCell and getCell():getGridSquare(args.src.x, args.src.y, args.src.z or 0) or nil
+		local objects = sq and sq.getObjects and sq:getObjects() or nil
+		if objects then
+			for i = 0, objects:size() - 1 do
+				local obj = objects:get(i)
+				local conts = {}
+				pcall(function()
+					local count = obj.getContainerCount and obj:getContainerCount() or 0
+					for ci = 0, count - 1 do
+						conts[#conts + 1] = obj:getContainerByIndex(ci)
+					end
+					if count == 0 and obj.getItemContainer and obj:getItemContainer() then
+						conts[#conts + 1] = obj:getItemContainer()
+					end
+				end)
+				for _, c in ipairs(conts) do
+					if c and c ~= src and not USV.isUnlimitedContainer(c) then
+						local it = nil
+						pcall(function()
+							it = c.getItemById and c:getItemById(args.itemID) or nil
+						end)
+						if it then
+							src = c
+							item = it
+							break
+						end
+					end
+				end
+				if item then
+					break
+				end
+			end
+		end
+	end
 	if not item then
 		-- Listen-server host often already applied the transfer via client prediction.
+		USV.logError("BlindTransfer: item not found in source id=" .. tostring(args.itemID))
 		return
 	end
 	if USV.isUSVFurnitureItem and USV.isUSVFurnitureItem(item) then
