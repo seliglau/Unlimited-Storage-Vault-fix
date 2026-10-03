@@ -3710,6 +3710,62 @@ function USV.syncEntityContentsSnapshot(entity)
 	})
 end
 
+--- Each sync re-encodes and writes the whole contents store, so syncing on every
+--- transferred item makes bulk transfers crawl. Queue per entity and write once
+--- the transfers settle.
+USV.SNAPSHOT_DEBOUNCE_MS = 1500
+USV._pendingSnapshots = USV._pendingSnapshots or {}
+-- Kahlua has no next(), so keep a count for the cheap per-tick check.
+USV._pendingSnapshotCount = USV._pendingSnapshotCount or 0
+
+local function usvNowMs()
+	return (getTimestampMs and getTimestampMs()) or (os.time() * 1000)
+end
+
+function USV.queueContentsSnapshot(entity)
+	if not entity then
+		return
+	end
+	if USV._pendingSnapshots[entity] == nil then
+		USV._pendingSnapshotCount = USV._pendingSnapshotCount + 1
+	end
+	USV._pendingSnapshots[entity] = usvNowMs() + USV.SNAPSHOT_DEBOUNCE_MS
+end
+
+local function usvEntityStillPlaced(entity)
+	local ok, placed = pcall(function()
+		local sq = entity.getSquare and entity:getSquare() or nil
+		if not sq then
+			return false
+		end
+		local objects = sq:getObjects()
+		return objects ~= nil and objects:contains(entity)
+	end)
+	return ok and placed
+end
+
+function USV.flushContentsSnapshots(force)
+	local now = usvNowMs()
+	for entity, due in pairs(USV._pendingSnapshots) do
+		if force or now >= due then
+			USV._pendingSnapshots[entity] = nil
+			USV._pendingSnapshotCount = math.max(0, USV._pendingSnapshotCount - 1)
+			-- Picked up / removed since queuing: the carry path already wrote its snapshot.
+			if usvEntityStillPlaced(entity) then
+				USV.syncEntityContentsSnapshot(entity)
+			end
+		end
+	end
+end
+
+if Events and Events.OnTick then
+	Events.OnTick.Add(function()
+		if USV._pendingSnapshotCount > 0 then
+			USV.flushContentsSnapshots(false)
+		end
+	end)
+end
+
 function USV.saveCarryContentsSnapshot(carryItem, packs, kind, ownerId, existingId)
 	if not carryItem then
 		return nil
@@ -6125,7 +6181,7 @@ function USV.doBlindTransfer(character, item, srcContainer, destContainer, opts)
 				end
 				local srcObj = USV.getContainerWorldObject(srcContainer)
 				if srcObj then
-					USV.syncEntityContentsSnapshot(srcObj)
+					USV.queueContentsSnapshot(srcObj)
 				end
 			end
 			return true
@@ -6164,7 +6220,7 @@ function USV.doBlindTransfer(character, item, srcContainer, destContainer, opts)
 		if added or srcUSV then
 			local srcObj = srcUSV and USV.getContainerWorldObject(srcContainer) or nil
 			if srcObj then
-				USV.syncEntityContentsSnapshot(srcObj)
+				USV.queueContentsSnapshot(srcObj)
 			end
 		end
 		if added then
@@ -6321,10 +6377,10 @@ function USV.doBlindTransfer(character, item, srcContainer, destContainer, opts)
 		local destObj = destUSV and USV.getContainerWorldObject(destContainer) or nil
 		local srcObj = srcUSV and USV.getContainerWorldObject(srcContainer) or nil
 		if destObj then
-			USV.syncEntityContentsSnapshot(destObj)
+			USV.queueContentsSnapshot(destObj)
 		end
 		if srcObj and srcObj ~= destObj then
-			USV.syncEntityContentsSnapshot(srcObj)
+			USV.queueContentsSnapshot(srcObj)
 		end
 	end
 	return added
