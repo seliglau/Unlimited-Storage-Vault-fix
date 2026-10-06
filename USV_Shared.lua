@@ -786,37 +786,56 @@ function USV.isContainerlessWorldObject(obj)
 	return ok and not has
 end
 
---- Capacity / transfer bypass: USV ModData / registry only (vanilla tiles may share sprites).
+--- [USV-FIX] Server-issued identity markers (claim + authorizeObject). A bare USV_Unlimited
+--- flag is NOT enough: it leaked onto vanilla floors/shelves/fridges and made every container unlimited.
+function USV.hasUSVAuthMarkers(obj)
+	if not obj or not obj.getModData then
+		return false
+	end
+	local ok, md = pcall(function()
+		return obj:getModData()
+	end)
+	if not ok or not md then
+		return false
+	end
+	local kind = md[USV.KIND_FLAG]
+	return md[USV.FLAG] == true
+		and md[USV.OWNER_FLAG] ~= nil
+		and type(md[USV.AUTH_FLAG]) == "string"
+		and kind ~= nil
+		and USV.KINDS[kind] ~= nil
+end
+
+--- [USV-FIX] Sprite is a USV build sprite or one of its appearance skins.
+function USV.isUSVOrAppearanceSprite(spriteName)
+	if not spriteName then
+		return false
+	end
+	if USV.resolveSpriteKind(spriteName) ~= nil then
+		return true
+	end
+	return appearanceBySprite[tostring(spriteName)] ~= nil
+end
+
+--- Capacity / transfer bypass / moveable identity.
+--- [USV-FIX] Strict: server/SP needs owner seal / registered placement / valid auth token
+--- (isTrustedUSVObject); MP clients (no server secret, no synced store) need the full set of
+--- server-issued markers. Flag-only, registry-only and name-only matches no longer count.
 function USV.isLegitimateUSVObject(obj)
 	if not obj then
 		return false
 	end
-	-- Hard identity first. Appearance skins can leave getContainerCount()==0 on some
-	-- tiles; those must still count as USV when FLAG/registry/trust is present.
-	if unlimitedParentRegistry[obj] then
-		return true
-	end
-	if USV.isFlaggedObject(obj) then
-		return true
-	end
-	if USV.isTrustedUSVObject(obj) then
-		return true
-	end
-	local md = obj.getModData and obj:getModData() or nil
-	if md and md[USV.KIND_FLAG] and (md[USV.OWNER_FLAG] or md[USV.AUTH_FLAG]) then
-		return true
-	end
-	-- Soft matches (placement coords / name): exclude floors/walls on the same tile.
-	if USV.isContainerlessWorldObject(obj) then
+	if not USV.isFlaggedObject(obj) then
 		return false
 	end
-	if USV.isRegisteredPlacementObject(obj) then
-		return true
+	-- Floors/walls/rugs on the same tile never count unless they wear a USV sprite.
+	if USV.isContainerlessWorldObject(obj) and not USV.isUSVOrAppearanceSprite(USV.getSpriteNameFast(obj)) then
+		return false
 	end
-	if USV.objectNameLooksUSV(obj) and USV.isFlaggedObject(obj) then
-		return true
+	if USV.isAuthoritative() then
+		return USV.isTrustedUSVObject(obj)
 	end
-	return false
+	return USV.hasUSVAuthMarkers(obj)
 end
 
 --- Strict trust: correct sprite + FLAG + registered owner + live coords match that owner's sealed placement
@@ -827,7 +846,8 @@ function USV.isTrustedUSVObject(obj)
 	end
 	local sprite = USV.getSpriteNameFast(obj)
 	local kindFromSprite = USV.resolveSpriteKind(sprite)
-	if not kindFromSprite and not USV.objectNameLooksUSV(obj) then
+	-- [USV-FIX] Appearance skins use vanilla tiles; accept them too (seal/auth checks below still apply).
+	if not kindFromSprite and not USV.isUSVOrAppearanceSprite(sprite) and not USV.objectNameLooksUSV(obj) then
 		return false
 	end
 	if not USV.isFlaggedObject(obj) then
@@ -1037,8 +1057,138 @@ function USV.stripUntrustedFlags(obj)
 	md[USV.WEIGHTLESS_FLAG] = nil
 	md[USV.APPEARANCE_FLAG] = nil
 	unlimitedParentRegistry[obj] = nil
+	-- [USV-FIX] Undo leaked USV names so vanilla titles come back ("∞ Unlimited Storage" etc.).
+	USV.clearLeakedUSVNames(obj, true)
 	USV.transmitObjectModData(obj)
 	return true
+end
+
+--- [USV-FIX] Exact USV world/container display names (loaded language + English fallbacks).
+local usvDisplayNames = nil
+function USV.isUSVDisplayName(name)
+	if not name or name == "" then
+		return false
+	end
+	if not usvDisplayNames then
+		usvDisplayNames = {}
+		for _, def in pairs(USV.KINDS) do
+			if def.worldNameFallback then
+				usvDisplayNames[def.worldNameFallback] = true
+			end
+			if def.containerNameFallback then
+				usvDisplayNames[def.containerNameFallback] = true
+			end
+			for _, key in ipairs({ def.worldNameKey or "", def.containerNameKey or "" }) do
+				if key ~= "" and getText then
+					local ok, t = pcall(getText, key)
+					if ok and t and t ~= "" and t ~= key then
+						usvDisplayNames[t] = true
+					end
+				end
+			end
+		end
+	end
+	return usvDisplayNames[tostring(name)] == true
+end
+
+--- [USV-FIX] Vanilla capacity of a world container, rebuilt the way
+--- IsoObject.createContainersFromSpriteProperties does it (sprite props; defaults 50 / freezer 15).
+local function usvPropGet(props, key, enumKey)
+	local v = nil
+	if enumKey and IsoPropertyType and IsoPropertyType[enumKey] then
+		pcall(function()
+			v = props:get(IsoPropertyType[enumKey])
+		end)
+	end
+	if v == nil then
+		pcall(function()
+			v = props:get(key)
+		end)
+	end
+	if v == nil then
+		pcall(function()
+			v = props:Val(key)
+		end)
+	end
+	return v
+end
+
+function USV.vanillaContainerCapacity(obj, container)
+	local props = nil
+	pcall(function()
+		local spr = obj:getSprite()
+		props = spr and spr:getProperties() or nil
+	end)
+	if not props then
+		return nil
+	end
+	local ctype = ""
+	pcall(function()
+		ctype = tostring(container:getType() or "")
+	end)
+	local isMain = false
+	pcall(function()
+		isMain = obj.getContainer and obj:getContainer() == container
+	end)
+	if not isMain and ctype == "freezer" then
+		return tonumber(usvPropGet(props, "FreezerCapacity", nil) or "") or 15
+	end
+	return tonumber(usvPropGet(props, "ContainerCapacity", "CONTAINER_CAPACITY") or "") or 50
+end
+
+--- [USV-FIX] Undo leaks on a NON-USV object: container titles live in the parent's ModData as
+--- "<type>_customContainerName". setCustomName(nil) stores the text "null", so delete the key
+--- instead. Capacity forced to 100 by ensureContainerCapacity is put back to the vanilla value.
+--- Runs on server/SP (persisted + transmitted) and locally on clients (display only).
+function USV.clearLeakedUSVNames(obj, wasFlagged)
+	if not obj or not obj.getModData then
+		return false
+	end
+	local changed = false
+	pcall(function()
+		if obj.getName and obj.setName and USV.isUSVDisplayName(obj:getName()) then
+			obj:setName(nil)
+			changed = true
+		end
+	end)
+	pcall(function()
+		local count = obj.getContainerCount and obj:getContainerCount() or 0
+		if count <= 0 then
+			return
+		end
+		-- Leaked titles live in object ModData; don't create empty ModData on every vanilla object.
+		if not wasFlagged and obj.hasModData and not obj:hasModData() then
+			return
+		end
+		local md = obj:getModData()
+		for i = 0, count - 1 do
+			local c = obj:getContainerByIndex(i)
+			if c then
+				USV.rememberUnlimitedContainer(c, false)
+				local leaked = wasFlagged == true
+				local ctype = c.getType and tostring(c:getType() or "") or ""
+				local key = ctype .. "_customContainerName"
+				local v = md and md[key] or nil
+				if v ~= nil and (v == "null" or v == "" or USV.isUSVDisplayName(v)) then
+					md[key] = nil
+					leaked = true
+					changed = true
+				end
+				if leaked and c.setCapacity then
+					local cur = nil
+					pcall(function()
+						cur = c:getCapacity()
+					end)
+					local want = USV.vanillaContainerCapacity(obj, c)
+					if want and cur == (USV.JAVA_CAPACITY_MAX or 100) and want ~= cur then
+						c:setCapacity(want)
+						changed = true
+					end
+				end
+			end
+		end
+	end)
+	return changed
 end
 
 function USV.getSafeHouseAt(square)
@@ -1931,17 +2081,9 @@ function USV.shouldReleaseOnRemove(obj)
 	if USV.isPreservingMove() then
 		return false
 	end
-	if USV.isFlaggedObject(obj) then
-		return true
-	end
-	local md = obj.getModData and obj:getModData() or nil
-	if md and (md[USV.OWNER_FLAG] or md[USV.KIND_FLAG] or md[USV.AUTH_FLAG]) then
-		return true
-	end
-	if USV.isRegisteredPlacementObject(obj) then
-		return true
-	end
-	return false
+	-- [USV-FIX] Only real USV objects. A leaked flag on a vanilla container used to make
+	-- destroy/dismantle/scrap WIPE its contents instead of the vanilla drop-to-floor.
+	return USV.isLegitimateUSVObject(obj)
 end
 
 --- Dismantle / scrap / destroy (not pickup). Always release ownership + placement.
@@ -1981,7 +2123,17 @@ function USV.isUSVMoveableItem(item)
 	if not ok or not md then
 		return false
 	end
-	return md[USV.FLAG] == true or md[USV.WEIGHTLESS_FLAG] == true or md[USV.KIND_FLAG] ~= nil
+	if not (md[USV.FLAG] == true or md[USV.WEIGHTLESS_FLAG] == true or md[USV.KIND_FLAG] ~= nil) then
+		return false
+	end
+	-- [USV-FIX] Leaked flags also rode along on ordinary picked-up furniture (sinks, shelves, rugs...),
+	-- which then got blocked from containers / made weightless. A real USV carry item is a Moveable
+	-- whose world sprite is a USV build sprite or one of its appearance skins.
+	local sprite = nil
+	pcall(function()
+		sprite = item.getWorldSprite and item:getWorldSprite() or nil
+	end)
+	return sprite ~= nil and USV.isUSVOrAppearanceSprite(tostring(sprite))
 end
 
 --- True for a picked-up USV vault/fridge furniture item (not ordinary loot).
@@ -4164,6 +4316,10 @@ function USV.isUSVCarryItem(item)
 	if not item then
 		return false
 	end
+	-- [USV-FIX] Same sprite gate as isUSVMoveableItem (no flag-only matches on vanilla furniture).
+	if not USV.isUSVMoveableItem(item) then
+		return false
+	end
 	if USV.isAuthorizedCarryItem(item) then
 		return true
 	end
@@ -4183,16 +4339,9 @@ function USV.useFixedCarryWeight(item)
 	if not item then
 		return false
 	end
+	-- [USV-FIX] WEIGHTLESS-flag-only fallback removed (leaked onto vanilla furniture items).
 	if USV.isUSVCarryItem(item) or USV.isUSVMoveableItem(item) or USV.isUSVFurnitureItem(item) then
 		return true
-	end
-	if item.getModData then
-		local ok, md = pcall(function()
-			return item:getModData()
-		end)
-		if ok and md and md[USV.WEIGHTLESS_FLAG] == true then
-			return true
-		end
 	end
 	return false
 end
@@ -4261,23 +4410,9 @@ function USV.parentLooksLikeUSV(parent)
 end
 
 --- Authoritative capacity: FLAG / custom-name alone is not enough (anti forge).
+--- [USV-FIX] Registry shortcut removed (it could hold leaked vanilla parents); same gate as identity.
 function USV.isCapacityTrustedParent(obj)
-	if not obj then
-		return false
-	end
-	if unlimitedParentRegistry[obj] then
-		return true
-	end
-	if USV.isTrustedUSVObject(obj) then
-		return true
-	end
-	if USV.isAuthoritative() and USV.verifyAuthToken(obj) then
-		return true
-	end
-	if USV.isRegisteredPlacementObject(obj) and USV.isFlaggedObject(obj) then
-		return true
-	end
-	return false
+	return USV.isLegitimateUSVObject(obj)
 end
 
 function USV.playerNearObjectOrSquare(player, obj, sq, maxDist)
@@ -4361,51 +4496,14 @@ function USV.isUnlimitedContainer(container)
 		parent = USV.resolveContainerParent(container)
 	end
 
-	-- Server / SP: never grant unlimited from forged FLAG or renamed customName alone.
-	if USV.isAuthoritative() then
-		if parent and USV.isCapacityTrustedParent(parent) then
-			USV.rememberUnlimitedParent(parent)
-			USV.rememberUnlimitedContainer(container, true)
-			USV.ensureContainerCapacity(container)
-			return true
-		end
-		return false
-	end
-
-	-- Client soft path (UI / prediction only — server rejects forged BlindTransfer).
-	if nativeParent then
-		local okN, cname = pcall(function()
-			return container.getCustomName and container:getCustomName() or nil
-		end)
-		if okN and cname then
-			local s = tostring(cname)
-			if string.find(s, "∞", 1, true) or string.find(s, "Unlimited", 1, true) or string.find(s, "無限", 1, true) then
-				if parent then
-					USV.rememberUnlimitedParent(parent)
-				end
-				USV.rememberUnlimitedContainer(container, true)
-				USV.ensureContainerCapacity(container)
-				return true
-			end
-		end
-		local okM, md = pcall(function()
-			return container.getModData and container:getModData() or nil
-		end)
-		if okM and md and md[USV.FLAG] == true then
-			if parent then
-				USV.rememberUnlimitedParent(parent)
-			end
-			USV.rememberUnlimitedContainer(container, true)
-			USV.ensureContainerCapacity(container)
-			return true
-		end
-	end
-
+	-- [USV-FIX] One strict gate for server, SP and client. The old client soft path trusted a
+	-- container customName containing "Unlimited"/"∞" or a container FLAG; both leaked onto
+	-- vanilla containers, so every world container became "Unlimited Storage x / 999999".
 	if not parent then
 		return false
 	end
 
-	if USV.isLegitimateUSVObject(parent) then
+	if USV.isCapacityTrustedParent(parent) then
 		USV.rememberUnlimitedParent(parent)
 		USV.rememberUnlimitedContainer(container, true)
 		USV.ensureContainerCapacity(container)
@@ -5301,6 +5399,11 @@ function USV.scanSquare(square)
 			and not USV.isRegisteredPlacementObject(obj) then
 			-- Forged FLAG / KIND without seal or registry — strip so capacity bypass cannot stick.
 			USV.stripUntrustedFlags(obj)
+		elseif not USV.isFlaggedObject(obj) then
+			-- [USV-FIX] Vanilla container that kept a leaked "∞ Unlimited ..." / "null" title or 100 cap.
+			if USV.clearLeakedUSVNames(obj, false) then
+				USV.transmitObjectModData(obj)
+			end
 		end
 	end
 end
@@ -8156,7 +8259,8 @@ local function patchDumpContentsInSquare(cls, label)
 		return true
 	end
 	index.dumpContentsInSquare = function(self, ...)
-		if USV.isTrustedUSVObject(self) or USV.isFlaggedObject(self) then
+		-- [USV-FIX] Was "trusted OR flagged": leaked flags made vanilla containers delete their items.
+		if USV.isLegitimateUSVObject(self) then
 			if USV.isPreservingMove() then
 				return nil
 			end
