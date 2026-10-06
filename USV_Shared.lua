@@ -287,6 +287,38 @@ USV.BLIND_XFER_MAX_DIST = 12 -- tiles; BlindTransfer must be near the USV
 USV.CLIENT_CMD_RATE_WINDOW_MS = 1000
 USV.CLIENT_CMD_RATE_LIMIT = 80 -- commands per window per player (bulk transfer bursts)
 
+-- #region agent log
+	USV.DEBUG_SESSION_BUILD = "e67d2b-review03"
+function USV.debugSessionLog(hypothesisId, location, message, data)
+	local ts = (getTimestampMs and getTimestampMs()) or 0
+	local dataParts = {}
+	if type(data) == "table" then
+		for k, v in pairs(data) do
+			dataParts[#dataParts + 1] = tostring(k) .. "=" .. tostring(v)
+		end
+	end
+	table.sort(dataParts)
+	local line = string.format(
+		'{"sessionId":"e67d2b","runId":"%s","hypothesisId":"%s","location":"%s","message":"%s","data":"%s","timestamp":%s}',
+		tostring(USV.DEBUG_SESSION_BUILD),
+		tostring(hypothesisId),
+		tostring(location),
+		tostring(message),
+		table.concat(dataParts, ";"),
+		tostring(ts)
+	)
+	pcall(function()
+		if getFileWriter then
+			local w = getFileWriter("debug-e67d2b.log", true, true)
+			if w then
+				w:write(line .. "\r\n")
+				w:close()
+			end
+		end
+	end)
+end
+-- #endregion
+
 USV.rebuildSpriteKindMap()
 
 local function placementEquals(a, b)
@@ -732,7 +764,9 @@ function USV.isUSVSpriteObject(obj)
 	return USV.resolveSpriteKind(USV.getSpriteNameFast(obj)) ~= nil
 end
 
---- World objects with no container (floors, walls) share the USV tile but are never the USV itself.
+--- Floors/walls share the USV tile but have no item container. Placement registry
+--- matches by coords only, so these must never count as legitimate USV objects
+--- (SetAppearance / scanSquare would otherwise pick the floor first).
 function USV.isContainerlessWorldObject(obj)
 	if not obj or not instanceof or not instanceof(obj, "IsoObject") then
 		return false
@@ -757,9 +791,8 @@ function USV.isLegitimateUSVObject(obj)
 	if not obj then
 		return false
 	end
-	if USV.isContainerlessWorldObject(obj) then
-		return false
-	end
+	-- Hard identity first. Appearance skins can leave getContainerCount()==0 on some
+	-- tiles; those must still count as USV when FLAG/registry/trust is present.
 	if unlimitedParentRegistry[obj] then
 		return true
 	end
@@ -769,11 +802,15 @@ function USV.isLegitimateUSVObject(obj)
 	if USV.isTrustedUSVObject(obj) then
 		return true
 	end
-	if USV.isRegisteredPlacementObject(obj) then
-		return true
-	end
 	local md = obj.getModData and obj:getModData() or nil
 	if md and md[USV.KIND_FLAG] and (md[USV.OWNER_FLAG] or md[USV.AUTH_FLAG]) then
+		return true
+	end
+	-- Soft matches (placement coords / name): exclude floors/walls on the same tile.
+	if USV.isContainerlessWorldObject(obj) then
+		return false
+	end
+	if USV.isRegisteredPlacementObject(obj) then
 		return true
 	end
 	if USV.objectNameLooksUSV(obj) and USV.isFlaggedObject(obj) then
@@ -1538,6 +1575,7 @@ function USV.canPlaceKind(kind, player, square, relocating)
 	local sh = nil
 	if USV.enforceSafehouseOnlyPlacement() and not relocating then
 		if not square or not player then
+			USV.debugSessionLog("G", "canPlaceKind", "place_blocked_needSafehouse", { kind = kind, why = "no_square_or_player" })
 			return false, "needSafehouse"
 		end
 		sh = USV.getSafeHouseAt(square)
@@ -1545,6 +1583,7 @@ function USV.canPlaceKind(kind, player, square, relocating)
 			return false, "needSafehouse"
 		end
 		if not USV.playerAllowedInSafehouse(sh, player, square) then
+			USV.debugSessionLog("G", "canPlaceKind", "place_blocked_needSafehouse", { kind = kind, why = "not_member" })
 			return false, "needSafehouse"
 		end
 	elseif square then
@@ -1558,6 +1597,7 @@ function USV.canPlaceKind(kind, player, square, relocating)
 				count = math.max(0, count - 1)
 			end
 			if count >= maxS then
+				USV.debugSessionLog("G", "canPlaceKind", "place_blocked_safehouse", { kind = kind, count = count, maxS = maxS })
 				return false, "safehouse"
 			end
 		end
@@ -3482,6 +3522,7 @@ function USV.deleteLuaFile(relName)
 	local primary, allAbs = USV.luaFolderAbsolutePath(relName)
 	allAbs = allAbs or (primary and { primary } or {})
 	local deleted = false
+	local via = "none"
 	local function tryAbs(abs)
 		if not abs or deleted then
 			return
@@ -3491,9 +3532,11 @@ function USV.deleteLuaFile(relName)
 				local fs = ZomboidFileSystem.instance
 				if fs.tryDeleteFile then
 					fs:tryDeleteFile(abs)
+					via = "tryDeleteFile"
 				end
 				if fs.deleteFile then
 					fs:deleteFile(abs)
+					via = via == "none" and "deleteFile" or via
 				end
 			end
 		end)
@@ -3505,6 +3548,7 @@ function USV.deleteLuaFile(relName)
 			if f and f.exists and f:exists() and f.delete then
 				if f:delete() then
 					deleted = true
+					via = "java.io.File"
 				end
 			end
 		end)
@@ -3512,6 +3556,7 @@ function USV.deleteLuaFile(relName)
 			local ok = pcall(os.remove, abs)
 			if ok then
 				deleted = true
+				via = "os.remove"
 			end
 		end
 	end
@@ -3519,6 +3564,7 @@ function USV.deleteLuaFile(relName)
 	pcall(function()
 		if ZomboidFileSystem and ZomboidFileSystem.instance and ZomboidFileSystem.instance.tryDeleteFile then
 			ZomboidFileSystem.instance:tryDeleteFile(relName)
+			via = "tryDeleteFile_rel"
 		end
 	end)
 	for _, abs in ipairs(allAbs) do
@@ -3527,6 +3573,9 @@ function USV.deleteLuaFile(relName)
 	-- Authority: if getFileReader can no longer open it, treat as deleted.
 	if not usvFileStillReadable(relName) then
 		deleted = true
+		if via == "none" then
+			via = "unreadable"
+		end
 	end
 	-- Do NOT write tombstone stubs — that recreates files the user sees as "not consolidated".
 	return deleted
@@ -3730,6 +3779,12 @@ function USV.queueContentsSnapshot(entity)
 		USV._pendingSnapshotCount = USV._pendingSnapshotCount + 1
 	end
 	USV._pendingSnapshots[entity] = usvNowMs() + USV.SNAPSHOT_DEBOUNCE_MS
+	-- #region agent log
+	USV.debugSessionLog("B", "queueContentsSnapshot", "snapshot_queued", {
+		pending = USV._pendingSnapshotCount,
+		debounceMs = USV.SNAPSHOT_DEBOUNCE_MS,
+	})
+	-- #endregion
 end
 
 local function usvEntityStillPlaced(entity)
@@ -3746,6 +3801,7 @@ end
 
 function USV.flushContentsSnapshots(force)
 	local now = usvNowMs()
+	local flushed = 0
 	for entity, due in pairs(USV._pendingSnapshots) do
 		if force or now >= due then
 			USV._pendingSnapshots[entity] = nil
@@ -3753,9 +3809,19 @@ function USV.flushContentsSnapshots(force)
 			-- Picked up / removed since queuing: the carry path already wrote its snapshot.
 			if usvEntityStillPlaced(entity) then
 				USV.syncEntityContentsSnapshot(entity)
+				flushed = flushed + 1
 			end
 		end
 	end
+	-- #region agent log
+	if flushed > 0 or force then
+		USV.debugSessionLog("B", "flushContentsSnapshots", "snapshot_flushed", {
+			flushed = flushed,
+			pending = USV._pendingSnapshotCount,
+			force = force == true,
+		})
+	end
+	-- #endregion
 end
 
 if Events and Events.OnTick then
@@ -3806,6 +3872,11 @@ function USV.restoreContentsFromSnapshot(entity, contentsId)
 	-- Extra guard: never restore another world's stash even if file was copied.
 	local worldKey = USV.getWorldSaveKey()
 	if data.world and data.world ~= worldKey then
+		USV.debugSessionLog("R", "restoreContentsFromSnapshot", "contents_json_world_blocked", {
+			id = tostring(contentsId),
+			fileWorld = data.world,
+			currentWorld = worldKey,
+		})
 		return 0
 	end
 	local packs = USV.descriptorsToPacks(data)
@@ -5681,10 +5752,6 @@ function USV.installCapacityHooks()
 			end
 			local blocked, why = USV.usvFurnitureBlockedInContainer(item, self)
 			if blocked then
-				local destType = ""
-				pcall(function()
-					destType = self.getType and tostring(self:getType() or "") or ""
-				end)
 				return false
 			end
 			if isUnlimitedSafe(self) then
@@ -5695,9 +5762,6 @@ function USV.installCapacityHooks()
 				if USV.containerIsUSVFridge(self) then
 					local allow = USV.itemAllowedInUSVFridge(self, item, oldIsItemAllowed, ...)
 					local ctype = USV.containerFridgeCompartmentType(self)
-					if not allow then
-					elseif not USV.isFridgeFoodItemStrict(item) and ctype ~= "fridge" and ctype ~= "freezer" then
-					end
 					return allow
 				end
 			end
@@ -5904,6 +5968,14 @@ function USV.packContainerRef(container, character)
 	-- Only tag the ref as USV when the parent really is one. A plain crate also has
 	-- coords, and usvX makes the server look for a USV object only, so it resolves nil.
 	local usvParent = ownerId ~= nil or kind ~= nil or (parent ~= nil and USV.isFlaggedObject(parent))
+	-- #region agent log
+	USV.debugSessionLog("C", "packContainerRef", "pack_world", {
+		ctype = ctype,
+		usvParent = usvParent,
+		hasUsvX = usvParent and coords ~= nil,
+		index = index,
+	})
+	-- #endregion
 	return {
 		kind = "world",
 		x = sq:getX(),
@@ -6362,8 +6434,6 @@ function USV.doBlindTransfer(character, item, srcContainer, destContainer, opts)
 			end)
 		end
 	end
-	if added then
-	end
 	pcall(function()
 		if srcContainer and srcContainer.setDrawDirty then
 			srcContainer:setDrawDirty(true)
@@ -6496,6 +6566,12 @@ function USV.clientBlindTransferNow(character, item, srcContainer, destContainer
 	local itemID = nil
 	pcall(function()
 		itemID = item.getID and item:getID() or nil
+	end)
+	local srcType = ""
+	local hasWI = false
+	pcall(function()
+		srcType = srcContainer.getType and tostring(srcContainer:getType() or "") or ""
+		hasWI = item.getWorldItem and item:getWorldItem() ~= nil
 	end)
 	if action and itemID ~= nil then
 		action.usvSentIDs = action.usvSentIDs or {}
@@ -7384,7 +7460,15 @@ function USV.installMoveableHooks()
 		local prevFromObject = ISMoveableSpriteProps.fromObject
 		ISMoveableSpriteProps.fromObject = function(obj)
 			local s = prevFromObject(obj)
-			if s and obj and USV.isUSVMoveableObject(obj, s.spriteName) then
+			local isUSV = obj and USV.isUSVMoveableObject(obj, s and s.spriteName or nil)
+			-- Appearance skins are often missing from vanilla moveable tables; synthesize props.
+			if isUSV and not s and ISMoveableSpriteProps.new then
+				local sprName = USV.getSpriteNameFast(obj)
+				pcall(function()
+					s = ISMoveableSpriteProps.new(sprName)
+				end)
+			end
+			if s and isUSV then
 				s.isMoveable = true
 				s.pickUpTool = nil
 				s.placeTool = nil
@@ -7392,7 +7476,23 @@ function USV.installMoveableHooks()
 				s.pickUpLevel = 0
 				s.weight = USV.MOVEABLE_CARRY_WEIGHT or 1
 				s.rawWeight = (USV.MOVEABLE_CARRY_WEIGHT or 1) * 10
+				s.object = obj
+				if not s.spriteName then
+					s.spriteName = USV.getSpriteNameFast(obj)
+				end
 			end
+			-- #region agent log
+			if isUSV or (obj and USV.isFlaggedObject(obj)) then
+				USV.debugSessionLog("D", "fromObject", "moveable_from_object", {
+					isUSV = isUSV == true,
+					hasProps = s ~= nil,
+					isMoveable = s and s.isMoveable == true,
+					sprite = s and s.spriteName or USV.getSpriteNameFast(obj) or "",
+					containerless = obj and USV.isContainerlessWorldObject(obj) or false,
+					flagged = obj and USV.isFlaggedObject(obj) or false,
+				})
+			end
+			-- #endregion
 			return s
 		end
 		ISMoveableSpriteProps._USV_FromObjectWrapped = true
@@ -7455,8 +7555,6 @@ function USV.installMoveableHooks()
 	local prev = ISMoveableSpriteProps.canPickUpMoveableInternal
 	ISMoveableSpriteProps.canPickUpMoveableInternal = function(self, _character, _square, _object, _isMulti)
 		local isUSV = USV.isUSVMoveableObject(_object, self.spriteName)
-		if _object then
-		end
 		if isUSV then
 			-- nil object skips isObjectNoContainerOrEmpty; carry weight is fixed (contents ignored).
 			local oldWeight = self.weight
@@ -7468,10 +7566,21 @@ function USV.installMoveableHooks()
 					self.yOffsetCursor = _object:getRenderYOffset() or 0
 				end)
 			end
-			if ok then
-				return allowed and true or false
-			end
-			return true
+			-- Appearance skins / MP can still make vanilla return false; USV furniture must stay movable.
+			local result = true
+			-- #region agent log
+			USV.debugSessionLog("D", "canPickUpMoveableInternal", "pickup_can_eval", {
+				isUSV = true,
+				flagged = _object and USV.isFlaggedObject(_object) or false,
+				containerless = _object and USV.isContainerlessWorldObject(_object) or false,
+				sprite = tostring(self.spriteName or USV.getSpriteNameFast(_object) or ""),
+				spriteKind = tostring(USV.resolveSpriteKind(self.spriteName or USV.getSpriteNameFast(_object)) or "nil"),
+				vanillaOk = ok == true,
+				vanillaAllowed = allowed == true,
+				result = result,
+			})
+			-- #endregion
+			return result
 		end
 		return prev(self, _character, _square, _object, _isMulti)
 	end
@@ -7585,13 +7694,6 @@ function USV.installMoveableHooks()
 					USV.purgeNestedFurnitureItems(item)
 				end)
 				USV.makeMoveableWeightless(item)
-				local gw, ga, gc, customW = nil, nil, nil, nil
-				pcall(function()
-					gw = item.getWeight and item:getWeight() or nil
-					ga = item.getActualWeight and item:getActualWeight() or nil
-					gc = item.getContentsWeight and item:getContentsWeight() or nil
-					customW = item.isCustomWeight and item:isCustomWeight() or nil
-				end)
 			elseif item and USV.isUSVCarryItem(item) then
 				USV.makeMoveableWeightless(item)
 			end

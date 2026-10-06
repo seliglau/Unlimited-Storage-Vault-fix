@@ -301,6 +301,17 @@ local function onClientCommand(module, command, player, args)
 		if objects then
 			for i = 0, objects:size() - 1 do
 				local candidate = objects:get(i)
+				-- #region agent log
+				if USV.debugSessionLog then
+					local spr = USV.getSpriteNameFast and USV.getSpriteNameFast(candidate) or ""
+					USV.debugSessionLog("A", "SetAppearance", "candidate", {
+						i = i,
+						sprite = spr,
+						containerless = USV.isContainerlessWorldObject and USV.isContainerlessWorldObject(candidate) or false,
+						legitimate = USV.isLegitimateUSVObject(candidate) == true,
+					})
+				end
+				-- #endregion
 				if candidate and USV.isLegitimateUSVObject(candidate) then
 					obj = candidate
 					break
@@ -308,9 +319,25 @@ local function onClientCommand(module, command, player, args)
 			end
 		end
 		if not obj then
+			-- #region agent log
+			if USV.debugSessionLog then
+				USV.debugSessionLog("A", "SetAppearance", "no_legitimate_obj", {
+					x = args.x,
+					y = args.y,
+					z = args.z or 0,
+				})
+			end
+			-- #endregion
 			return
 		end
 		if not USV.playerCanCustomize(player, obj) then
+			-- #region agent log
+			if USV.debugSessionLog then
+				USV.debugSessionLog("A", "SetAppearance", "customize_denied", {
+					appearanceId = args.appearanceId,
+				})
+			end
+			-- #endregion
 			return
 		end
 		local ps = player.getSquare and player:getSquare() or nil
@@ -323,6 +350,14 @@ local function onClientCommand(module, command, player, args)
 		end
 		if not USV.applyAppearance(obj, args.appearanceId, true) then
 			USV.logError("SetAppearance failed id=" .. tostring(args.appearanceId))
+		else
+			-- #region agent log
+			if USV.debugSessionLog then
+				USV.debugSessionLog("A", "SetAppearance", "appearance_ok", {
+					appearanceId = args.appearanceId,
+				})
+			end
+			-- #endregion
 		end
 		return
 	end
@@ -510,8 +545,8 @@ local function onClientCommand(module, command, player, args)
 	end
 	local item = findItemById(src, args.itemID, player, args.src)
 	if not item and src and args.src and args.src.kind == "world" and args.src.x ~= nil then
-		-- Stacked crates share one tile and type, and the ref has no way to tell them apart,
-		-- so resolveContainerRef returns the first one. Look in the other non-USV containers there.
+		-- Stacked crates share one tile and type; resolveContainerRef returns the first one.
+		-- Look in the other non-USV containers on that tile.
 		local sq = getCell and getCell():getGridSquare(args.src.x, args.src.y, args.src.z or 0) or nil
 		local objects = sq and sq.getObjects and sq:getObjects() or nil
 		if objects then
@@ -534,6 +569,14 @@ local function onClientCommand(module, command, player, args)
 							it = c.getItemById and c:getItemById(args.itemID) or nil
 						end)
 						if it then
+							-- #region agent log
+							if USV.debugSessionLog then
+								USV.debugSessionLog("C", "BlindTransfer", "stacked_src_fallback", {
+									itemID = args.itemID,
+									objIndex = i,
+								})
+							end
+							-- #endregion
 							src = c
 							item = it
 							break
@@ -549,6 +592,15 @@ local function onClientCommand(module, command, player, args)
 	if not item then
 		-- Listen-server host often already applied the transfer via client prediction.
 		USV.logError("BlindTransfer: item not found in source id=" .. tostring(args.itemID))
+		-- #region agent log
+		if USV.debugSessionLog then
+			USV.debugSessionLog("C", "BlindTransfer", "item_miss", {
+				itemID = args.itemID,
+				srcKind = args.src and args.src.kind or "",
+				hasUsvX = args.src and args.src.usvX ~= nil,
+			})
+		end
+		-- #endregion
 		return
 	end
 	if USV.isUSVFurnitureItem and USV.isUSVFurnitureItem(item) then
