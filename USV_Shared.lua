@@ -920,7 +920,10 @@ local function ownerObjectStillAt(sealed, ownerId, kind, ignoreObj)
 	end
 	for i = 0, objects:size() - 1 do
 		local other = objects:get(i)
-		if other and other ~= ignoreObj and USV.isFlaggedObject(other) then
+		-- [USV-FIX] Only a real vault/fridge object holds the seal. A floor/rug left with a copied
+		-- USV owner flag on the old tile made every later relocation fail ("place rejected duplicate").
+		if other and other ~= ignoreObj and USV.isFlaggedObject(other)
+			and not (USV.isContainerlessWorldObject(other) and not USV.isUSVOrAppearanceSprite(USV.getSpriteNameFast(other))) then
 			local omd = other.getModData and other:getModData() or nil
 			if omd and omd[USV.OWNER_FLAG] == ownerId and (omd[USV.KIND_FLAG] or "vault") == kind then
 				return true
@@ -1466,7 +1469,10 @@ function USV.squareHasKindObject(square, kind)
 		local obj = objects:get(i)
 		if obj then
 			local okind = USV.getObjectKind(obj) or USV.resolveSpriteKind(USV.getSpriteNameFast(obj))
-			if okind == kind and (USV.isFlaggedObject(obj) or USV.isLegitimateUSVObject(obj) or USV.objectNameLooksUSV(obj)) then
+			-- [USV-FIX] A floor/rug with a leaked USV flag at an old spot made the safehouse look full,
+			-- so a carried vault could not be placed again. Count only objects that can be the USV.
+			local canBeUSV = not (USV.isContainerlessWorldObject(obj) and not USV.isUSVOrAppearanceSprite(USV.getSpriteNameFast(obj)))
+			if canBeUSV and okind == kind and (USV.isFlaggedObject(obj) or USV.isLegitimateUSVObject(obj) or USV.objectNameLooksUSV(obj)) then
 				return true
 			end
 		end
@@ -6028,6 +6034,26 @@ function USV.packContainerRef(container, character)
 	if inChar then
 		return { kind = "player" }
 	end
+	-- [USV-FIX] Vehicle part containers (trunk, seats, glovebox): the parent is a BaseVehicle, which is
+	-- not in the square's object list, so a "world" ref resolved to the floor and the move failed.
+	local vehicleRef = nil
+	pcall(function()
+		local p = container.getParent and container:getParent() or nil
+		if p and instanceof and instanceof(p, "BaseVehicle") then
+			local partId = nil
+			for i = 0, (p:getPartCount() or 0) - 1 do
+				local part = p:getPartByIndex(i)
+				if part and part:getItemContainer() == container then
+					partId = part:getId()
+					break
+				end
+			end
+			vehicleRef = { kind = "vehicle", vehicleId = p:getId(), partId = partId or container:getType() }
+		end
+	end)
+	if vehicleRef then
+		return vehicleRef
+	end
 	local ctype = ""
 	pcall(function()
 		ctype = container.getType and tostring(container:getType() or "") or ""
@@ -6097,6 +6123,24 @@ end
 function USV.resolveContainerRef(ref, character)
 	if not ref or not ref.kind then
 		return nil
+	end
+	if ref.kind == "vehicle" then
+		-- [USV-FIX] See packContainerRef.
+		local c = nil
+		pcall(function()
+			local v = getVehicleById and getVehicleById(tonumber(ref.vehicleId) or -1) or nil
+			-- Must be next to the vehicle (no remote looting through a forged id).
+			if v and character and character.getX then
+				local dx, dy = v:getX() - character:getX(), v:getY() - character:getY()
+				local maxD = USV.BLIND_XFER_MAX_DIST or 12
+				if dx * dx + dy * dy > maxD * maxD then
+					v = nil
+				end
+			end
+			local part = v and ref.partId and v:getPartById(tostring(ref.partId)) or nil
+			c = part and part:getItemContainer() or nil
+		end)
+		return c
 	end
 	if ref.kind == "player" then
 		return character and character.getInventory and character:getInventory() or nil
