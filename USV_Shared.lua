@@ -846,10 +846,10 @@ function USV.isTrustedUSVObject(obj)
 	end
 	local sprite = USV.getSpriteNameFast(obj)
 	local kindFromSprite = USV.resolveSpriteKind(sprite)
-	-- [USV-FIX] Appearance skins use vanilla tiles; accept them too (seal/auth checks below still apply).
-	if not kindFromSprite and not USV.isUSVOrAppearanceSprite(sprite) and not USV.objectNameLooksUSV(obj) then
-		return false
-	end
+	-- [USV-FIX] The sprite/name pre-check now only guards the weak coords-only fallback below.
+	-- A freshly built B42 entity has no sprite or name yet when OnObjectAdded -> scanSquare runs,
+	-- so it failed this check and scanSquare stripped the new vault/fridge's flags.
+	local looksUSV = kindFromSprite ~= nil or USV.isUSVOrAppearanceSprite(sprite) or USV.objectNameLooksUSV(obj)
 	if not USV.isFlaggedObject(obj) then
 		return false
 	end
@@ -870,7 +870,7 @@ function USV.isTrustedUSVObject(obj)
 	end
 
 	-- Fallback: legacy placements list (pre-ownerPlacement saves) matched by live tile.
-	if USV.isRegisteredPlacementObject(obj) then
+	if looksUSV and USV.isRegisteredPlacementObject(obj) then
 		return true
 	end
 
@@ -5385,6 +5385,48 @@ function USV.applyObject(obj, force, kind)
 	return true
 end
 
+--- [USV-FIX] Server/SP: a vault/fridge whose flags were stripped by the earlier OnObjectAdded bug still
+--- sits on its owner's sealed tile. Re-flag it from the seal so it is unlimited again (contents untouched).
+function USV.tryRecoverSealedObject(obj)
+	if not USV.isAuthoritative() or not obj or not obj.getModData or USV.isFlaggedObject(obj) then
+		return false
+	end
+	if USV.isContainerlessWorldObject(obj) then
+		return false
+	end
+	local sprite = USV.getSpriteNameFast(obj)
+	if not USV.isUSVOrAppearanceSprite(sprite) then
+		return false
+	end
+	local live = USV.getLiveCoords(obj)
+	local store = USV.getStore()
+	if not live or not store or not store.ownerPlacement then
+		return false
+	end
+	for kind, byOwner in pairs(store.ownerPlacement) do
+		if USV.getKindDef(kind) and type(byOwner) == "table" then
+			for ownerId, list in pairs(byOwner) do
+				if store.ownersByKind and store.ownersByKind[kind] and store.ownersByKind[kind][ownerId]
+					and USV.ownerHasSealAt(kind, ownerId, live) then
+					local md = obj:getModData()
+					md[USV.FLAG] = true
+					md[USV.OWNER_FLAG] = ownerId
+					md[USV.KIND_FLAG] = kind
+					if USV.authorizeObject(obj, kind) then
+						USV.applyObject(obj, true, kind)
+						return true
+					end
+					md[USV.FLAG] = nil
+					md[USV.OWNER_FLAG] = nil
+					md[USV.KIND_FLAG] = nil
+					return false
+				end
+			end
+		end
+	end
+	return false
+end
+
 function USV.scanSquare(square)
 	if not square or not square.getObjects then
 		return
@@ -5405,6 +5447,8 @@ function USV.scanSquare(square)
 			and not USV.isRegisteredPlacementObject(obj) then
 			-- Forged FLAG / KIND without seal or registry — strip so capacity bypass cannot stick.
 			USV.stripUntrustedFlags(obj)
+		elseif not USV.isFlaggedObject(obj) and USV.tryRecoverSealedObject(obj) then
+			-- [USV-FIX] Restored a stripped vault/fridge from its owner seal.
 		elseif not USV.isFlaggedObject(obj) then
 			-- [USV-FIX] Vanilla container that kept a leaked "∞ Unlimited ..." / "null" title or 100 cap.
 			if USV.clearLeakedUSVNames(obj, false) then
