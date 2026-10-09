@@ -6791,6 +6791,67 @@ function USV.transferIsValidUnlimited(self)
 	return true
 end
 
+--- [USV-FIX] MP client: a transfer OUT of a USV only sends a BlindTransfer command. Vanilla follow-up
+--- actions (craft from nearby containers, eat, read...) queue right behind it and start before the
+--- server has moved the item, so the server rejects the craft and only the move happens.
+--- Keep such transfers running (maxTime -1) until every sent item is in the destination.
+USV.BLIND_ARRIVAL_TIMEOUT_MS = 5000
+
+function USV.blindTransferShouldWait(action)
+	if not action or not action.destContainer or not action.destContainer.containsID then
+		return false
+	end
+	local destType = ""
+	pcall(function()
+		destType = tostring(action.destContainer:getType() or "")
+	end)
+	if destType == "floor" then
+		return false
+	end
+	-- Deposits into a USV don't feed a follow-up action; keep them instant for bulk transfers.
+	return not USV.isUnlimitedContainer(action.destContainer)
+end
+
+--- Send every queued item of a USV transfer action (same as the perform() drain, without sounds).
+function USV.sendQueuedBlindTransfers(action)
+	pcall(function()
+		action:checkQueueList()
+	end)
+	local list = action.queueList or {}
+	for _, queued in ipairs(list) do
+		if queued and queued.items then
+			for _, item in ipairs(queued.items) do
+				local hasItem = false
+				pcall(function()
+					hasItem = action.srcContainer and action.srcContainer:contains(item) or false
+					if not hasItem then
+						local srcType = action.srcContainer and tostring(action.srcContainer:getType() or "") or ""
+						hasItem = srcType == "floor" or (item.getWorldItem and item:getWorldItem() ~= nil)
+					end
+				end)
+				if hasItem then
+					USV.clientBlindTransferNow(action.character, item, action.srcContainer, action.destContainer, action)
+				end
+			end
+		end
+	end
+end
+
+function USV.blindTransferArrived(action)
+	if not action.usvSentIDs then
+		return true
+	end
+	for id, _ in pairs(action.usvSentIDs) do
+		local ok, has = pcall(function()
+			return action.destContainer:containsID(id)
+		end)
+		if ok and not has then
+			return false
+		end
+	end
+	return true
+end
+
 function USV.installTransferHooks()
 	-- Auto-resolve srcContainer for floor items in ISInventoryTransferUtil
 	if ISInventoryTransferUtil and type(ISInventoryTransferUtil.newInventoryTransferAction) == "function"
@@ -6915,12 +6976,14 @@ function USV.installTransferHooks()
 							self:startActionAnim()
 						end
 					end)
+					-- [USV-FIX] Withdrawals wait for the server move (see blindTransferShouldWait).
+					self.usvWaitArrival = USV.blindTransferShouldWait(self)
 					if self.action then
 						if self.action.setWaitForFinished then
 							self.action:setWaitForFinished(false)
 						end
 						if self.action.setTime then
-							self.action:setTime(0)
+							self.action:setTime(self.usvWaitArrival and -1 or 0)
 						end
 					end
 					return
@@ -6936,6 +6999,22 @@ function USV.installTransferHooks()
 			local prevUpdate = ISInventoryTransferAction.update
 			ISInventoryTransferAction.update = function(self)
 				if self and USV.transferInvolvesUnlimited(self.srcContainer, self.destContainer) then
+					if self.usvBlindDone and isClient and isClient() and self.usvWaitArrival then
+						-- [USV-FIX] Send now, finish only once the items are in the destination (or timeout).
+						if not self.usvBlindSent then
+							self.usvBlindSent = true
+							self.usvWaitStartMs = usvNowMs()
+							USV.sendQueuedBlindTransfers(self)
+						end
+						if not self.usvBlindForced and (USV.blindTransferArrived(self)
+							or usvNowMs() - (self.usvWaitStartMs or 0) > USV.BLIND_ARRIVAL_TIMEOUT_MS) then
+							self.usvBlindForced = true
+							pcall(function()
+								self:forceComplete()
+							end)
+						end
+						return
+					end
 					if self.usvBlindDone and isClient and isClient() then
 						if not self.usvBlindForced then
 							self.usvBlindForced = true
